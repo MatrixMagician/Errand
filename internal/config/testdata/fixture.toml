@@ -1,0 +1,21 @@
+[defaults]
+user            = "oliverh"
+timeout         = "120s"
+max_output      = "1MiB"
+known_hosts     = "~/.ssh/known_hosts"
+identity_files  = ["~/.ssh/id_ed25519"]
+
+[hosts.web-prod]
+hostname   = "web1.example.net"
+port       = 2222
+user       = "deploy"
+timeout    = "60s"
+
+[hosts.lab]
+hostname   = "10.20.0.5"
+accept_new = true
+max_output = "256KiB"
+
+[hosts.db-restore]
+hostname   = "db2.example.net"
+host_key   = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGhvc3RrZXlmaWxsZXJmaWxsZXJmaWxsZXJmaWxsZXI"
