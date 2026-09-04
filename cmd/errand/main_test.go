@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"os"
@@ -176,7 +177,7 @@ func TestQuietSilencesOnlyErrandsOwnDiagnostics(t *testing.T) {
 // flags that bound a connection are check's too, the ones that shape a command
 // are not.
 func TestCheckDeclaresTheSharedFlags(t *testing.T) {
-	shared := []string{"timeout", "connect-timeout", "quiet"}
+	shared := []string{"timeout", "connect-timeout", "quiet", "json"}
 	runOnly := []string{"stdin", "pty", "env", "max-output"}
 	for _, sub := range []string{"run", "check"} {
 		fs := flag.NewFlagSet(sub, flag.ContinueOnError)
@@ -191,5 +192,56 @@ func TestCheckDeclaresTheSharedFlags(t *testing.T) {
 				t.Errorf("%s declares --%s: %v, want %v", sub, name, got, want)
 			}
 		}
+	}
+}
+
+// TestJSONEnvelopeSurvivesPreConnectionFailures is the wiring --json needs most:
+// a caller parsing stdout gets a verdict even when errand never got as far as
+// dialling, and gets it whichever side of the host the flag was written on.
+func TestJSONEnvelopeSurvivesPreConnectionFailures(t *testing.T) {
+	t.Setenv("ERRAND_CONFIG", "testdata/fixture.toml")
+	cases := []struct {
+		name string
+		args []string
+		kind string
+	}{
+		{"before the host", []string{"run", "--json", "ghost", "--", "true"}, "config"},
+		{"after the host", []string{"run", "ghost", "--json", "--", "true"}, "config"},
+		{"a usage error", []string{"run", "web-prod", "--json"}, "usage"},
+		{"check too", []string{"check", "--json", "ghost"}, "config"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			code, stdout, stderr := runCLI(t, c.args...)
+			if code != 250 {
+				t.Fatalf("code=%d, want 250; stderr=%q", code, stderr)
+			}
+			var env struct {
+				V      int    `json:"v"`
+				Status string `json:"status"`
+				Exit   int    `json:"exit_code"`
+				Error  *struct {
+					Kind    string `json:"kind"`
+					Message string `json:"message"`
+				} `json:"error"`
+			}
+			if err := json.Unmarshal([]byte(stdout), &env); err != nil {
+				t.Fatalf("stdout is not the envelope: %v\nstdout: %q", err, stdout)
+			}
+			if env.V != 1 || env.Status != "client_error" || env.Exit != 250 {
+				t.Errorf("envelope = %+v, want v1 client_error 250", env)
+			}
+			if env.Error == nil || env.Error.Kind != c.kind || env.Error.Message == "" {
+				t.Errorf("error = %+v, want kind %q with a message", env.Error, c.kind)
+			}
+		})
+	}
+}
+
+func TestWithoutJSONNothingIsWrittenToStdout(t *testing.T) {
+	t.Setenv("ERRAND_CONFIG", "testdata/fixture.toml")
+	code, stdout, _ := runCLI(t, "run", "ghost", "--", "true")
+	if code != 250 || stdout != "" {
+		t.Errorf("code=%d stdout=%q, want 250 and nothing on stdout", code, stdout)
 	}
 }

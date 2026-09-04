@@ -17,6 +17,7 @@ import (
 
 	"github.com/MatrixMagician/Errand/internal/client"
 	"github.com/MatrixMagician/Errand/internal/config"
+	"github.com/MatrixMagician/Errand/internal/envelope"
 	"github.com/MatrixMagician/Errand/internal/exec"
 	"github.com/MatrixMagician/Errand/internal/result"
 )
@@ -36,6 +37,7 @@ flags for run and check:
   --timeout <dur>                               wall-clock limit for the whole invocation
   --connect-timeout <dur>                       limit for TCP, handshake and auth, within --timeout
   --quiet                                       suppress errand's own diagnostics, never the remote's
+  --json                                        write a JSON result envelope as the final line of stdout
 
 flags for run only:
   --stdin                                       stream local stdin to the remote command
@@ -75,46 +77,52 @@ func run(args []string, stdout, stderr io.Writer) int {
 	fs.SetOutput(io.Discard) // we print errors ourselves with the errand: prefix
 	fs.Usage = func() {}     // printed by us: on -h below, never on a parse error
 	o := registerFlags(fs, sub)
-	if err := fs.Parse(rest); err != nil {
-		if errors.Is(err, flag.ErrHelp) {
+	perr := fs.Parse(rest)
+	// Even a failed parse may have seen --json already, and a caller who asked
+	// for machine-readable output wants it for the failure too.
+	env := jsonOutput(nil, o, stdout)
+	if perr != nil {
+		if errors.Is(perr, flag.ErrHelp) {
 			fmt.Fprint(stdout, usage)
 			return 0
 		}
-		return fail(diag, result.Usage, "", fmt.Errorf("%s: %v", sub, err))
+		return fail(diag, env, result.Usage, "", fmt.Errorf("%s: %v", sub, perr))
 	}
 
 	cfg, err := config.Load(config.DefaultPath())
 	if err != nil {
-		return fail(diag, result.Resolve, "", err)
+		return fail(diag, env, result.Resolve, "", err)
 	}
 	if sub == "hosts" {
 		return hosts(cfg, stdout, diag)
 	}
 
 	if fs.NArg() == 0 {
-		return fail(diag, result.Usage, "", fmt.Errorf("%s: missing <host>", sub))
+		return fail(diag, env, result.Usage, "", fmt.Errorf("%s: missing <host>", sub))
 	}
 	alias := fs.Arg(0)
 	// Flags are also accepted after the host, so parse what follows it.
-	if err := fs.Parse(fs.Args()[1:]); err != nil {
-		return fail(diag, result.Usage, "", fmt.Errorf("%s: %v", sub, err))
+	perr = fs.Parse(fs.Args()[1:])
+	env = jsonOutput(env, o, stdout)
+	if perr != nil {
+		return fail(diag, env, result.Usage, "", fmt.Errorf("%s: %v", sub, perr))
 	}
 	// Only now is --quiet known. Everything above it is a usage error, which
 	// is the one diagnostic an operator needs whether they asked for it or not.
 	diag = diagnostics(stderr, o.quiet)
 	h, err := cfg.Resolve(alias)
 	if err != nil {
-		return fail(diag, result.Resolve, alias, err)
+		return fail(diag, env, result.Resolve, alias, err)
 	}
 	if sub != "run" && sub != "check" {
-		return fail(diag, result.Usage, "", fmt.Errorf("%s: not implemented", sub))
+		return fail(diag, env, result.Usage, "", fmt.Errorf("%s: not implemented", sub))
 	}
 
 	var req exec.Request
 	if sub == "run" {
 		command := strings.Join(fs.Args(), " ")
 		if command == "" {
-			return fail(diag, result.Usage, "", errors.New("run: missing <command>"))
+			return fail(diag, env, result.Usage, "", errors.New("run: missing <command>"))
 		}
 		if !given(fs, "max-output") {
 			o.maxOutput = int64(h.MaxOutput)
@@ -123,13 +131,19 @@ func run(args []string, stdout, stderr io.Writer) int {
 		if o.stdin {
 			in = os.Stdin
 		}
+		// Remote stdout goes through the envelope writer so it knows where the
+		// output ended; nothing is buffered and nothing is rewritten.
+		out := stdout
+		if env != nil {
+			out = env
+		}
 		req = exec.Request{
-			Command: command, Stdin: in, Stdout: stdout, Stderr: stderr,
+			Command: command, Stdin: in, Stdout: out, Stderr: stderr,
 			MaxOutput: o.maxOutput, Env: o.env, PTY: o.pty,
 		}
 	} else {
 		if fs.NArg() > 0 {
-			return fail(diag, result.Usage, "", fmt.Errorf("check: takes no command, got %q", fs.Arg(0)))
+			return fail(diag, env, result.Usage, "", fmt.Errorf("check: takes no command, got %q", fs.Arg(0)))
 		}
 		// check is run with the question narrowed to the connection: a command
 		// every host has, and both streams discarded, so the only thing the
@@ -148,14 +162,14 @@ func run(args []string, stdout, stderr io.Writer) int {
 	if sub == "check" && res.ExitCode() == 0 {
 		diag("ok %s connect=%dms", res.Target, res.Connect.Milliseconds())
 	}
-	return finish(res, diag)
+	return finish(res, diag, env)
 }
 
 // options are the flag values a subcommand accepts. registerFlags owns which
 // subcommand declares which, so the flags run and check share are described in
 // exactly one place.
 type options struct {
-	stdin, pty, quiet       bool
+	stdin, pty, quiet, json bool
 	env                     envFlag
 	timeout, connectTimeout time.Duration
 	maxOutput               int64
@@ -167,6 +181,7 @@ func registerFlags(fs *flag.FlagSet, sub string) *options {
 		return &o
 	}
 	fs.BoolVar(&o.quiet, "quiet", false, "suppress errand's own diagnostics")
+	fs.BoolVar(&o.json, "json", false, "write a JSON result envelope as the final line of stdout")
 	fs.DurationVar(&o.timeout, "timeout", 0, "wall-clock limit for the whole invocation")
 	fs.DurationVar(&o.connectTimeout, "connect-timeout", defaultConnectTimeout, "limit for TCP, handshake and auth")
 	if sub == "run" {
@@ -246,19 +261,35 @@ func attempt(ctx context.Context, h config.Host, timeout, connect time.Duration,
 
 // finish is the single exit path: every outcome, including the ones that never
 // reached a connection, is reported and scored here.
-func finish(res result.Result, diag client.Diag) int {
+func finish(res result.Result, diag client.Diag, env *envelope.Writer) int {
 	if d := res.Diagnostic(); d != "" {
 		diag("%s", d)
+	}
+	if env != nil {
+		if err := env.Emit(res); err != nil {
+			diag("writing the JSON envelope: %v", err)
+		}
 	}
 	return res.ExitCode()
 }
 
-func fail(diag client.Diag, phase result.Phase, host string, err error) int {
-	return finish(result.Result{Host: host, Err: phase.Wrap(host, err)}, diag)
+// jsonOutput builds the envelope writer the first time --json is seen. The
+// flag is accepted on either side of the host, and the writer that tracked
+// where remote stdout ended has to be the one that emits, so an existing
+// writer is kept rather than replaced.
+func jsonOutput(have *envelope.Writer, o *options, stdout io.Writer) *envelope.Writer {
+	if have != nil || !o.json {
+		return have
+	}
+	return envelope.New(stdout)
+}
+
+func fail(diag client.Diag, env *envelope.Writer, phase result.Phase, host string, err error) int {
+	return finish(result.Result{Host: host, Err: phase.Wrap(host, err)}, diag, env)
 }
 
 func failUsage(stderr io.Writer, diag client.Diag, err error) int {
-	code := fail(diag, result.Usage, "", err)
+	code := fail(diag, nil, result.Usage, "", err)
 	fmt.Fprint(stderr, usage)
 	return code
 }
@@ -298,7 +329,7 @@ func hosts(cfg *config.File, stdout io.Writer, diag client.Diag) int {
 			h.Alias, h.Hostname, h.Port, h.User, h.Timeout, h.MaxOutput, yesNo(h.AcceptNew), pinned(h.HostKey))
 	}
 	if err := tw.Flush(); err != nil {
-		return fail(diag, result.Usage, "", err)
+		return fail(diag, nil, result.Usage, "", err)
 	}
 	return 0
 }
