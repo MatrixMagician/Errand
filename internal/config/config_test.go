@@ -193,3 +193,15 @@ func TestDefaultPath(t *testing.T) {
 		t.Errorf("DefaultPath() = %q", p)
 	}
 }
+
+func TestDefaultAuditLog(t *testing.T) {
+	t.Setenv("HOME", "/home/tester")
+	t.Setenv("XDG_STATE_HOME", "")
+	if p := DefaultAuditLog(); p != "/home/tester/.local/state/errand/audit.jsonl" {
+		t.Errorf("DefaultAuditLog() = %q", p)
+	}
+	t.Setenv("XDG_STATE_HOME", "/var/state")
+	if p := DefaultAuditLog(); p != "/var/state/errand/audit.jsonl" {
+		t.Errorf("DefaultAuditLog() = %q", p)
+	}
+}
