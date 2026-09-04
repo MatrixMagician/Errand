@@ -33,6 +33,7 @@ const usage = `usage:
   errand put   <host> [flags] <local> <remote>  upload a file (SFTP)
   errand get   <host> [flags] <remote> <local>  download a file (SFTP)
   errand check <host> [flags]                   preflight: connect, authenticate, run 'true'
+  errand allow <subcommand> [args...]           would the invocation be unattended? exit 0 yes, 1 no with the reason on stdout
   errand hosts                                  list declared hosts and resolved parameters
   errand version                                print the version
 
@@ -78,59 +79,26 @@ func run(args []string, stdout, stderr io.Writer) int {
 	case "version":
 		fmt.Fprintf(stdout, "errand %s\n", buildVersion())
 		return 0
+	case "allow":
+		return allow(rest, stdout, stderr)
 	case "hosts", "run", "put", "get", "check":
 	default:
 		return failUsage(stderr, diag, fmt.Errorf("unknown subcommand %q", sub))
 	}
 
-	fs := flag.NewFlagSet("errand "+sub, flag.ContinueOnError)
-	fs.SetOutput(io.Discard) // we print errors ourselves with the errand: prefix
-	fs.Usage = func() {}     // printed by us: on -h below, never on a parse error
-	o := registerFlags(fs, sub)
-	perr := fs.Parse(rest)
-	// Even a failed parse may have seen --json already, and a caller who asked
-	// for machine-readable output wants it for the failure too.
-	env := jsonOutput(nil, o, stdout)
-	if perr != nil {
-		if errors.Is(perr, flag.ErrHelp) {
-			fmt.Fprint(stdout, usage)
-			return 0
-		}
-		return fail(diag, env, result.Usage, "", fmt.Errorf("%s: %v", sub, perr))
+	inv, code := parse(sub, rest, stdout, stderr)
+	if inv == nil {
+		return code
 	}
+	if inv.sub == "hosts" {
+		return hosts(inv.cfg, stdout, inv.diag)
+	}
+	fs, o, env, diag, h := inv.fs, inv.o, inv.env, inv.diag, inv.host
 
-	cfg, err := config.Load(config.DefaultPath())
-	if err != nil {
-		return fail(diag, env, result.Resolve, "", err)
-	}
-	if sub == "hosts" {
-		return hosts(cfg, stdout, diag)
-	}
-
-	if fs.NArg() == 0 {
-		return fail(diag, env, result.Usage, "", fmt.Errorf("%s: missing <host>", sub))
-	}
-	alias := fs.Arg(0)
-	// Flags are also accepted after the host, so parse what follows it.
-	perr = fs.Parse(fs.Args()[1:])
-	env = jsonOutput(env, o, stdout)
-	if perr != nil {
-		return fail(diag, env, result.Usage, "", fmt.Errorf("%s: %v", sub, perr))
-	}
-	// Only now is --quiet known. Everything above it is a usage error, which
-	// is the one diagnostic an operator needs whether they asked for it or not.
-	diag = diagnostics(stderr, o.quiet)
-	h, err := cfg.Resolve(alias)
-	if err != nil {
-		return fail(diag, env, result.Resolve, alias, err)
-	}
 	var body func(context.Context, *client.Conn) result.Result
-	switch sub {
+	switch inv.sub {
 	case "run":
 		command := strings.Join(fs.Args(), " ")
-		if command == "" {
-			return fail(diag, env, result.Usage, "", errors.New("run: missing <command>"))
-		}
 		if !given(fs, "max-output") {
 			o.maxOutput = int64(h.MaxOutput)
 		}
@@ -150,32 +118,23 @@ func run(args []string, stdout, stderr io.Writer) int {
 		}
 		body = func(ctx context.Context, c *client.Conn) result.Result { return exec.Run(ctx, c, req) }
 	case "check":
-		if fs.NArg() > 0 {
-			return fail(diag, env, result.Usage, "", fmt.Errorf("check: takes no command, got %q", fs.Arg(0)))
-		}
 		// check is run with the question narrowed to the connection: a command
 		// every host has, and both streams discarded, so the only thing the
 		// caller learns is whether errand could get there and back.
 		req := exec.Request{Command: "true", Stdout: io.Discard, Stderr: io.Discard}
 		body = func(ctx context.Context, c *client.Conn) result.Result { return exec.Run(ctx, c, req) }
 	case "put":
-		if fs.NArg() != 2 {
-			return fail(diag, env, result.Usage, "", fmt.Errorf("put: want <local> <remote>, got %d arguments", fs.NArg()))
-		}
 		local, remote := fs.Arg(0), fs.Arg(1)
 		body = func(ctx context.Context, c *client.Conn) result.Result {
 			return transfer.Put(ctx, c, local, remote, o.mode, o.maxSize)
 		}
 	case "get":
-		if fs.NArg() != 2 {
-			return fail(diag, env, result.Usage, "", fmt.Errorf("get: want <remote> <local>, got %d arguments", fs.NArg()))
-		}
 		remote, local := fs.Arg(0), fs.Arg(1)
 		body = func(ctx context.Context, c *client.Conn) result.Result {
 			return transfer.Get(ctx, c, remote, local, o.maxSize)
 		}
 	default:
-		return fail(diag, env, result.Usage, "", fmt.Errorf("%s: not implemented", sub))
+		return fail(diag, env, result.Usage, "", fmt.Errorf("%s: not implemented", inv.sub))
 	}
 	if !given(fs, "timeout") {
 		o.timeout = h.Timeout
@@ -183,11 +142,87 @@ func run(args []string, stdout, stderr io.Writer) int {
 	ctx, stop := interruptible(context.Background())
 	defer stop()
 	res := attempt(ctx, h, o.timeout, o.connectTimeout, diag, body)
-	res.Op = sub
-	if sub == "check" && res.ExitCode() == 0 {
+	res.Op = inv.sub
+	if inv.sub == "check" && res.ExitCode() == 0 {
 		diag("ok %s connect=%dms", res.Target, res.Connect.Milliseconds())
 	}
 	return finish(res, diag, env, auditPath(h))
+}
+
+// invocation is everything a subcommand knows before it dials: the flags on
+// either side of the alias, the file they were resolved against, the Host,
+// and the arguments that remain.
+type invocation struct {
+	sub  string
+	fs   *flag.FlagSet
+	o    *options
+	env  *envelope.Writer
+	diag client.Diag
+	cfg  *config.File
+	host config.Host // zero for hosts, which has no alias
+}
+
+// parse is the whole prelude: flags before and after the alias, the config
+// file, the alias, and the arity of what follows it. Every failure is a usage
+// or configuration error, reported here; the caller gets nil and the exit code.
+func parse(sub string, rest []string, stdout, stderr io.Writer) (*invocation, int) {
+	diag := diagnostics(stderr, false)
+	fs := flag.NewFlagSet("errand "+sub, flag.ContinueOnError)
+	fs.SetOutput(io.Discard) // we print errors ourselves with the errand: prefix
+	fs.Usage = func() {}     // printed by us: on -h below, never on a parse error
+	o := registerFlags(fs, sub)
+	perr := fs.Parse(rest)
+	// Even a failed parse may have seen --json already, and a caller who asked
+	// for machine-readable output wants it for the failure too.
+	env := jsonOutput(nil, o, stdout)
+	if perr != nil {
+		if errors.Is(perr, flag.ErrHelp) {
+			fmt.Fprint(stdout, usage)
+			return nil, 0
+		}
+		return nil, fail(diag, env, result.Usage, "", fmt.Errorf("%s: %v", sub, perr))
+	}
+
+	cfg, err := config.Load(config.DefaultPath())
+	if err != nil {
+		return nil, fail(diag, env, result.Resolve, "", err)
+	}
+	if sub == "hosts" {
+		return &invocation{sub: sub, fs: fs, o: o, env: env, diag: diag, cfg: cfg}, 0
+	}
+
+	if fs.NArg() == 0 {
+		return nil, fail(diag, env, result.Usage, "", fmt.Errorf("%s: missing <host>", sub))
+	}
+	alias := fs.Arg(0)
+	// Flags are also accepted after the host, so parse what follows it.
+	perr = fs.Parse(fs.Args()[1:])
+	env = jsonOutput(env, o, stdout)
+	if perr != nil {
+		return nil, fail(diag, env, result.Usage, "", fmt.Errorf("%s: %v", sub, perr))
+	}
+	// Only now is --quiet known. Everything above it is a usage error, which
+	// is the one diagnostic an operator needs whether they asked for it or not.
+	diag = diagnostics(stderr, o.quiet)
+	h, err := cfg.Resolve(alias)
+	if err != nil {
+		return nil, fail(diag, env, result.Resolve, alias, err)
+	}
+	var arity error
+	switch {
+	case sub == "run" && strings.Join(fs.Args(), " ") == "":
+		arity = errors.New("run: missing <command>")
+	case sub == "check" && fs.NArg() > 0:
+		arity = fmt.Errorf("check: takes no command, got %q", fs.Arg(0))
+	case sub == "put" && fs.NArg() != 2:
+		arity = fmt.Errorf("put: want <local> <remote>, got %d arguments", fs.NArg())
+	case sub == "get" && fs.NArg() != 2:
+		arity = fmt.Errorf("get: want <remote> <local>, got %d arguments", fs.NArg())
+	}
+	if arity != nil {
+		return nil, fail(diag, env, result.Usage, "", arity)
+	}
+	return &invocation{sub: sub, fs: fs, o: o, env: env, diag: diag, cfg: cfg, host: h}, 0
 }
 
 // options are the flag values a subcommand accepts. registerFlags owns which

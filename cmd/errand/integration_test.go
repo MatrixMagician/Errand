@@ -28,15 +28,16 @@ import (
 // hostConfig describes the config file one test needs. The zero value points
 // alias "h" at the harness with its client key and an empty known_hosts.
 type hostConfig struct {
-	knownHosts string
-	identities []string
-	hostname   string
-	port       int
-	timeout    string
-	maxOutput  string
-	acceptNew  bool
-	hostKey    string
-	auditLog   string
+	knownHosts    string
+	identities    []string
+	hostname      string
+	port          int
+	timeout       string
+	maxOutput     string
+	allowCommands string
+	acceptNew     bool
+	hostKey       string
+	auditLog      string
 }
 
 func writeConfig(t *testing.T, s *sshtest.Server, o hostConfig) string {
@@ -60,6 +61,9 @@ func writeConfig(t *testing.T, s *sshtest.Server, o hostConfig) string {
 	}
 	if o.maxOutput != "" {
 		settings += fmt.Sprintf("max_output = %q\n", o.maxOutput)
+	}
+	if o.allowCommands != "" {
+		settings += fmt.Sprintf("allow_commands = %s\n", o.allowCommands)
 	}
 	if o.acceptNew {
 		settings += "accept_new = true\n"
@@ -1156,6 +1160,25 @@ func TestIntegrationAuditRecordsARun(t *testing.T) {
 	records, raw = auditLog(t, cfg)
 	if len(records) != 2 || records[0] != got {
 		t.Errorf("a second run did not append after the first:\n%s", raw)
+	}
+}
+
+// TestIntegrationRunIgnoresTheAllowlist is ADR-0003's seam under test. The
+// Host allows nothing, yet run executes and is logged; allow refuses the same
+// invocation without dialling and leaves the log as run left it.
+func TestIntegrationRunIgnoresTheAllowlist(t *testing.T) {
+	s := sshtest.Start(t)
+	cfg := writeConfig(t, s, hostConfig{knownHosts: s.KnownHostsLine() + "\n", allowCommands: "[]"})
+	if code, _, stderr := errand(t, cfg, "", "run", "h", "--", "true"); code != 0 {
+		t.Fatalf("run exited %d, stderr: %s", code, stderr)
+	}
+	code, stdout, stderr := errand(t, cfg, "", "allow", "run", "h", "--", "true")
+	if code != 1 || stdout != "not on allowlist: true\n" {
+		t.Fatalf("allow exited %d stdout=%q stderr=%q", code, stdout, stderr)
+	}
+	records, raw := auditLog(t, cfg)
+	if len(records) != 1 || records[0].Op != "run" {
+		t.Errorf("want one run and nothing from allow:\n%s", raw)
 	}
 }
 
