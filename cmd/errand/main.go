@@ -36,24 +36,25 @@ const usage = `usage:
   errand hosts                                  list declared hosts and resolved parameters
   errand version                                print the version
 
-flags for run, put, get and check:
-  --timeout <dur>                               wall-clock limit for the whole invocation
-  --connect-timeout <dur>                       limit for TCP, handshake and auth, within --timeout
+flags for run, put, get and check (before the command or the paths):
+  --timeout <dur>                               wall-clock limit for the whole invocation; default 120s or the host's timeout
+  --connect-timeout <dur>                       limit for TCP, handshake and auth, within --timeout; default 10s
   --quiet                                       suppress errand's own diagnostics, never the remote's
   --json                                        write a JSON result envelope as the final line of stdout
 
 flags for run only:
   --stdin                                       stream local stdin to the remote command
-  --max-output <bytes>                          combined cap across stdout and stderr; 0 disables
+  --max-output <bytes>                          combined cap across stdout and stderr; default 1MiB or the host's max_output; 0 disables
   --env KEY=VAL                                 set a remote environment variable; repeatable
   --pty                                         request a PTY for tools that refuse to run without one
 
 flags for put and get:
-  --max-size <bytes>                            reject a larger source file before transferring; default 64MiB
+  --max-size <bytes>                            reject a larger source file before transferring; default 64MiB; 0 disables
 
 flags for put only:
   --mode <octal>                                permission bits for the remote file; default 0644
 
+Durations use Go syntax (90s, 5m). Sizes are an integer with an optional KiB or MiB suffix.
 <host> is an alias declared in the config file (default ~/.config/errand/config.toml,
 overridable with ERRAND_CONFIG). Exit 250 on usage or configuration errors.
 `

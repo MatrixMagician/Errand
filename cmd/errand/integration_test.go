@@ -1682,3 +1682,90 @@ func TestIntegrationGetInterrupted(t *testing.T) {
 		t.Errorf("the temp file survives a cut transfer: %q", left)
 	}
 }
+
+// readmeExample is one line of a README ```sh block marked "# harness", and
+// the exit code it promises: 0 unless the line ends "# exit N".
+type readmeExample struct {
+	line string
+	exit int
+}
+
+func readmeExamples(t *testing.T) []readmeExample {
+	t.Helper()
+	exit := regexp.MustCompile(`\s*# exit (\d+)$`)
+	var out []readmeExample
+	for _, block := range strings.Split(readFile(t, "../../README.md"), "```sh\n")[1:] {
+		body, _, _ := strings.Cut(block, "```")
+		lines := strings.Split(strings.TrimSpace(body), "\n")
+		if lines[0] != "# harness" {
+			continue
+		}
+		for _, line := range lines[1:] {
+			if line == "" || strings.HasPrefix(line, "#") {
+				continue
+			}
+			ex := readmeExample{line: line}
+			if m := exit.FindStringSubmatch(line); m != nil {
+				ex.line = strings.TrimSuffix(line, m[0])
+				ex.exit, _ = strconv.Atoi(m[1])
+			}
+			out = append(out, ex)
+		}
+	}
+	return out
+}
+
+// TestReadmeExamples runs every harness-marked README line through sh against
+// the trusting config, with web-prod standing for the harness alias, so the
+// README cannot drift from the binary. Without jq on the machine, the jq stage
+// is dropped and the final stdout line is parsed here instead.
+func TestReadmeExamples(t *testing.T) {
+	s := sshtest.Start(t)
+	cfg := trusting(t, s)
+	examples := readmeExamples(t)
+	if len(examples) < 6 {
+		t.Fatalf("README has %d harness lines, want at least 6", len(examples))
+	}
+	dir := t.TempDir()
+	sshtest.WriteFile(t, dir, "restart.sh", "#!/bin/sh\necho restarted\n")
+	path := filepath.Dir(sshtest.Binary(t)) + ":" + os.Getenv("PATH")
+	_, jqErr := exec.LookPath("jq")
+
+	covered := map[string]bool{}
+	for _, ex := range examples {
+		line := strings.ReplaceAll(ex.line, "web-prod", "h")
+		covered[strings.Fields(line)[1]] = true
+		if strings.Contains(line, "| tail -n 1 | jq") {
+			covered["jq"] = true
+		}
+		parseJSON := false
+		if before, _, ok := strings.Cut(line, "| jq"); ok && jqErr != nil {
+			line, parseJSON = before, true
+		}
+		cmd := exec.Command("sh", "-c", line)
+		cmd.Dir = dir
+		cmd.Env = append(os.Environ(), "PATH="+path, "ERRAND_CONFIG="+cfg, "SSH_AUTH_SOCK=")
+		var stdout, stderr strings.Builder
+		cmd.Stdout, cmd.Stderr = &stdout, &stderr
+		if err := cmd.Run(); err != nil && cmd.ProcessState == nil {
+			t.Fatalf("%s: %v", ex.line, err)
+		}
+		code := cmd.ProcessState.ExitCode()
+		t.Logf("%s -> exit %d, stdout %q, stderr %q", ex.line, code, stdout.String(), stderr.String())
+		if code != ex.exit {
+			t.Errorf("%s: exit %d, README promises %d", ex.line, code, ex.exit)
+		}
+		if parseJSON {
+			last := strings.TrimSuffix(stdout.String(), "\n")
+			last = last[strings.LastIndex(last, "\n")+1:]
+			if !json.Valid([]byte(last)) {
+				t.Errorf("%s: final stdout line is not JSON: %q", ex.line, last)
+			}
+		}
+	}
+	for _, want := range []string{"run", "check", "put", "get", "hosts", "jq"} {
+		if !covered[want] {
+			t.Errorf("no harness example covers %s", want)
+		}
+	}
+}
