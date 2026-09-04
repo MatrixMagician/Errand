@@ -3,11 +3,13 @@
 package client
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"net"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -65,6 +67,11 @@ func dial(ctx context.Context, h config.Host, diag Diag) (*Conn, error) {
 	addr := net.JoinHostPort(h.Hostname, strconv.Itoa(h.Port))
 	start := time.Now()
 
+	verify, err := hostKeyPolicy(h, diag)
+	if err != nil {
+		return nil, err
+	}
+
 	var dialer net.Dialer
 	raw, err := dialer.DialContext(ctx, "tcp", addr)
 	if err != nil {
@@ -72,12 +79,6 @@ func dial(ctx context.Context, h config.Host, diag Diag) (*Conn, error) {
 	}
 	stop := context.AfterFunc(ctx, func() { _ = raw.Close() })
 	defer stop()
-
-	verify, err := hostKeyVerifier(h.KnownHosts)
-	if err != nil {
-		_ = raw.Close()
-		return nil, result.HostKey.Wrap(h.Alias, err)
-	}
 
 	methods, closeAgent := authMethods(h, diag)
 	defer closeAgent()
@@ -155,22 +156,30 @@ func authError(err error, methods int) error {
 	return errors.New(msg)
 }
 
-// hostKeyVerifier builds the known_hosts check. Files that are not there are
-// skipped; when none can be read every key is unknown, which is the safe
-// reading of "the operator recorded nothing".
-func hostKeyVerifier(files []string) (ssh.HostKeyCallback, error) {
-	var present []string
-	for _, f := range files {
-		if _, err := os.Stat(f); err == nil {
-			present = append(present, f)
+// hostKeyPolicy is the whole of SPEC §8 for one host. A configured pin replaces
+// known_hosts outright, accept_new may record a key known_hosts has never seen,
+// and nothing may accept a key that changed.
+func hostKeyPolicy(h config.Host, diag Diag) (ssh.HostKeyCallback, error) {
+	if h.HostKey != "" {
+		pin, _, _, _, err := ssh.ParseAuthorizedKey([]byte(h.HostKey))
+		if err != nil {
+			return nil, result.Resolve.Wrap(h.Alias, fmt.Errorf("host_key: %w", err))
 		}
+		return func(addr string, _ net.Addr, key ssh.PublicKey) error {
+			if bytes.Equal(key.Marshal(), pin.Marshal()) {
+				return nil
+			}
+			return pinMismatch(addr, key, pin)
+		}, nil
 	}
-	if len(present) == 0 {
-		return func(addr string, _ net.Addr, key ssh.PublicKey) error { return unknownKey(addr, key) }, nil
-	}
-	check, err := knownhosts.New(present...)
+
+	check, err := knownHostsCheck(h.KnownHosts)
 	if err != nil {
-		return nil, err
+		return nil, result.HostKey.Wrap(h.Alias, err)
+	}
+	unknown := unknownKey
+	if h.AcceptNew {
+		unknown = func(addr string, key ssh.PublicKey) error { return trustNew(h.KnownHosts, addr, key, diag) }
 	}
 	return func(addr string, remote net.Addr, key ssh.PublicKey) error {
 		err := check(addr, remote, key)
@@ -181,10 +190,70 @@ func hostKeyVerifier(files []string) (ssh.HostKeyCallback, error) {
 		case !errors.As(err, &ke):
 			return err
 		case len(ke.Want) == 0:
-			return unknownKey(addr, key)
+			return unknown(addr, key)
 		}
 		return changedKey(addr, key, ke.Want[0])
 	}, nil
+}
+
+// knownHostsCheck reads the files that are there and skips the ones that are
+// not. When none can be read every key comes back as an unknown one, which is
+// the safe reading of "the operator recorded nothing".
+func knownHostsCheck(files []string) (ssh.HostKeyCallback, error) {
+	var present []string
+	for _, f := range files {
+		if _, err := os.Stat(f); err == nil {
+			present = append(present, f)
+		}
+	}
+	if len(present) == 0 {
+		return func(string, net.Addr, ssh.PublicKey) error { return &knownhosts.KeyError{} }, nil
+	}
+	return knownhosts.New(present...)
+}
+
+// trustNew records an unknown key in the first configured known_hosts file so
+// the connection can proceed. A key we failed to write down is a key we never
+// agreed to trust, so a failed append fails the connection.
+func trustNew(files []string, addr string, key ssh.PublicKey, diag Diag) error {
+	path := config.ExpandHome("~/.ssh/known_hosts")
+	if len(files) > 0 {
+		path = files[0]
+	}
+	if err := appendLine(path, knownhosts.Line([]string{addr}, key)); err != nil {
+		return fmt.Errorf("cannot record the host key for %s in %s: %w", knownhosts.Normalize(addr), path, err)
+	}
+	diag("added host key for %s to %s (accept_new)", knownhosts.Normalize(addr), path)
+	return nil
+}
+
+func appendLine(path, line string) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return err
+	}
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return err
+	}
+	// A file the operator left without a final newline would otherwise have its
+	// last entry silently joined to ours.
+	var last [1]byte
+	if info, err := f.Stat(); err == nil && info.Size() > 0 {
+		if _, err := f.ReadAt(last[:], info.Size()-1); err == nil && last[0] != '\n' {
+			line = "\n" + line
+		}
+	}
+	if _, err := f.WriteString(line + "\n"); err != nil {
+		_ = f.Close()
+		return err
+	}
+	return f.Close()
+}
+
+func pinMismatch(addr string, key, pin ssh.PublicKey) error {
+	return fmt.Errorf("host key for %s does not match the configured pin: host_key is %s %s, server offered %s %s",
+		knownhosts.Normalize(addr), pin.Type(), ssh.FingerprintSHA256(pin),
+		key.Type(), ssh.FingerprintSHA256(key))
 }
 
 func unknownKey(addr string, key ssh.PublicKey) error {
