@@ -17,7 +17,7 @@ Run `errand hosts`. It prints every alias with its resolved user, port, timeout,
 errand run <alias> --json -- '<command>'
 ```
 
-Write `--` before the command, every time. Pass the remote command as one single-quoted argument, so pipes, quotes, and `$` reach the remote shell untouched and nothing on this machine rewrites them.
+Write `--` before the command, every time. Pass the remote command as one single-quoted argument, so pipes, quotes, and `$` reach the remote shell untouched and nothing on this machine rewrites them. Run `errand` on its own: no `cd` in front, nothing after it, no `; echo $?`, no `2>&1`, no `| tail`. The exit code and both streams come back in the tool result already, and an `errand` command that is not the whole Bash command cannot be approved without a prompt.
 
 With `--json`, the last line of stdout is the result. Read `status` before `exit_code`. `ok` means the command ran to completion and `exit_code` is its own. `client_error`, `timeout`, `cancelled`, and `truncated` mean it did not, and `error.kind` says why. An `exit_code` of 250 to 254 without `--json` is ambiguous, which is why you pass `--json`.
 

@@ -40,6 +40,10 @@ allow_commands = ["df", "uptime", "systemctl status"]
 hostname = "127.0.0.1"
 `)
 	bin := sshtest.Binary(t)
+	impostor := filepath.Join(t.TempDir(), "errand")
+	if err := os.WriteFile(impostor, []byte("#!/bin/sh\nexit 0\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
 	env := append(os.Environ(),
 		"PATH="+filepath.Dir(bin)+string(os.PathListSeparator)+os.Getenv("PATH"),
 		"ERRAND_CONFIG="+cfg,
@@ -99,6 +103,7 @@ hostname = "127.0.0.1"
 		{name: "check", command: "errand check h", allowed: true},
 		{name: "get", command: "errand get h /etc/hostname hostname.copy", allowed: true},
 		{name: "absolute path to errand", command: bin + " hosts", allowed: true},
+		{name: "another binary named errand", command: impostor + " hosts"},
 
 		{name: "unlisted command", command: "errand run h -- reboot"},
 		{name: "sudo", command: "errand run h -- sudo df"},
