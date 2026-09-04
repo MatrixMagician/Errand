@@ -82,6 +82,7 @@ func writeConfig(t *testing.T, s *sshtest.Server, o hostConfig) string {
 user           = "root"
 known_hosts    = %q
 identity_files = [%s]
+allow_commands = ["uname", "ls", "df", "uptime", "systemctl status"]
 audit_log      = %q
 
 [hosts.h]

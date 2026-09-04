@@ -471,3 +471,74 @@ func TestAllowLeavesTheAuditLogUntouched(t *testing.T) {
 		t.Errorf("allow wrote %v into the state directory", entries)
 	}
 }
+
+// TestAllowMatchingRules drives every scanning and matching rule through
+// errand allow itself: the rules are internal/allow's contract with the
+// operator, not an API worth testing beneath that surface.
+func TestAllowMatchingRules(t *testing.T) {
+	p := t.TempDir() + "/config.toml"
+	body := "[defaults]\n" +
+		"allow_commands = [\"ps\", \"grep\", \"systemctl status\", \"systemctl is-active\", \"cat\", \"ls\"]\n" +
+		"\n[hosts.h]\nhostname = \"h\"\n"
+	if err := os.WriteFile(p, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("ERRAND_CONFIG", p)
+
+	cases := []struct {
+		name   string
+		args   []string
+		code   int
+		stdout string
+	}{
+		{name: "pipeline of listed commands", args: []string{"run", "h", "--", "ps", "aux", "|", "grep", "nginx"}},
+		{name: "multi-word entry", args: []string{"run", "h", "--", "systemctl", "status", "nginx"}},
+		{name: "basename strips the path", args: []string{"run", "h", "--", "/usr/bin/cat", "/etc/hosts"}},
+		{name: "double-quoted pipe is text", args: []string{"run", "h", "--", "grep", `"a|b"`, "file"}},
+		{name: "single-quoted redirection is text", args: []string{"run", "h", "--", "grep", "'x > y'", "file"}},
+		{name: "single-quoted space is text", args: []string{"run", "h", "--", "cat", "'a b'"}},
+		{name: "escaped pipe is text", args: []string{"run", "h", "--", "grep", `\|`, "file"}},
+		{name: "unquoted variable is text", args: []string{"run", "h", "--", "ls", "$HOME"}},
+		{name: "two pipes of the same listed command", args: []string{"run", "h", "--", "cat", "a", "|", "cat", "|", "cat"}},
+		{name: "no separator before the command", args: []string{"run", "h", "ls", "-la"}},
+
+		{name: "unlisted second word", args: []string{"run", "h", "--", "systemctl", "restart", "nginx"}, code: 1, stdout: "not on allowlist: systemctl restart\n"},
+		{name: "too few words for any entry", args: []string{"run", "h", "--", "systemctl"}, code: 1, stdout: "not on allowlist: systemctl\n"},
+		{name: "unlisted command with a path", args: []string{"run", "h", "--", "/sbin/reboot", "now"}, code: 1, stdout: "not on allowlist: reboot\n"},
+		{name: "unlisted second segment", args: []string{"run", "h", "--", "ps", "aux", "|", "reboot"}, code: 1, stdout: "not on allowlist: reboot\n"},
+		{name: "output redirection", args: []string{"run", "h", "--", "cat", "a", ">", "b"}, code: 1, stdout: "redirection\n"},
+		{name: "append redirection", args: []string{"run", "h", "--", "cat", "a", ">>", "b"}, code: 1, stdout: "redirection\n"},
+		{name: "input redirection", args: []string{"run", "h", "--", "cat", "<", "a"}, code: 1, stdout: "redirection\n"},
+		{name: "fd redirection", args: []string{"run", "h", "--", "cat", "2>&1"}, code: 1, stdout: "redirection\n"},
+		{name: "sudo before a listed command", args: []string{"run", "h", "--", "sudo", "cat", "/etc/shadow"}, code: 1, stdout: "sudo\n"},
+		{name: "sudo with a path", args: []string{"run", "h", "--", "/usr/bin/sudo", "cat"}, code: 1, stdout: "sudo\n"},
+		{name: "sudo outranks the redirection after it", args: []string{"run", "h", "--", "sudo", "cat", ">", "x"}, code: 1, stdout: "sudo\n"},
+		{name: "env prefix", args: []string{"run", "h", "--", "LANG=C", "grep", "x", "y"}, code: 1, stdout: "env prefix\n"},
+		{name: "semicolon", args: []string{"run", "h", "--", "cat", "a;", "rm", "b"}, code: 1, stdout: "control operator\n"},
+		{name: "and-and", args: []string{"run", "h", "--", "cat", "a", "&&", "rm", "b"}, code: 1, stdout: "control operator\n"},
+		{name: "or-or", args: []string{"run", "h", "--", "cat", "a", "||", "rm", "b"}, code: 1, stdout: "control operator\n"},
+		{name: "background", args: []string{"run", "h", "--", "cat", "a", "&"}, code: 1, stdout: "control operator\n"},
+		{name: "real newline", args: []string{"run", "h", "--", "cat a\nrm b"}, code: 1, stdout: "control operator\n"},
+		{name: "dollar-paren substitution", args: []string{"run", "h", "--", "cat", "$(which x)"}, code: 1, stdout: "substitution\n"},
+		{name: "backtick substitution", args: []string{"run", "h", "--", "cat", "`which x`"}, code: 1, stdout: "substitution\n"},
+		{name: "dollar-paren inside double quotes", args: []string{"run", "h", "--", "cat", `"$(which x)"`}, code: 1, stdout: "substitution\n"},
+		{name: "backtick inside double quotes", args: []string{"run", "h", "--", "cat", "\"`id`\""}, code: 1, stdout: "substitution\n"},
+		{name: "unterminated double quote", args: []string{"run", "h", "--", "grep", `"a`}, code: 1, stdout: "unparseable\n"},
+		{name: "unterminated single quote", args: []string{"run", "h", "--", "grep", "'a"}, code: 1, stdout: "unparseable\n"},
+		{name: "trailing pipe", args: []string{"run", "h", "--", "cat", "a", "|"}, code: 1, stdout: "unparseable\n"},
+		{name: "leading pipe", args: []string{"run", "h", "--", "|", "cat"}, code: 1, stdout: "unparseable\n"},
+		{name: "empty segment between two pipes", args: []string{"run", "h", "--", "cat", "a", "|", "|", "cat"}, code: 1, stdout: "unparseable\n"},
+		{name: "trailing backslash", args: []string{"run", "h", "--", "cat", "a", `\`}, code: 1, stdout: "unparseable\n"},
+		{name: "whitespace-only command", args: []string{"run", "h", "--", "  "}, code: 1, stdout: "unparseable\n"},
+		{name: "unlisted command before the redirection that follows it", args: []string{"run", "h", "--", "reboot", ">", "x"}, code: 1, stdout: "not on allowlist: reboot\n"},
+		{name: "sudo in the second segment", args: []string{"run", "h", "--", "grep", "x", "|", "sudo", "cat"}, code: 1, stdout: "sudo\n"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			code, stdout, stderr := runCLI(t, append([]string{"allow"}, c.args...)...)
+			if code != c.code || stdout != c.stdout {
+				t.Errorf("code=%d stdout=%q, want %d and %q; stderr=%q", code, stdout, c.code, c.stdout, stderr)
+			}
+		})
+	}
+}
