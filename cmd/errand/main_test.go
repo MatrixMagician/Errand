@@ -332,3 +332,142 @@ func TestMaxSizeDefaultsTo64MiB(t *testing.T) {
 		}
 	}
 }
+
+// TestAllowFixedVerdicts pins the subcommands whose verdict does not depend on
+// the Command allowlist: everything that only reads is Unattended, and put,
+// the one write, never is.
+func TestAllowFixedVerdicts(t *testing.T) {
+	t.Setenv("ERRAND_CONFIG", "testdata/fixture.toml")
+	cases := []struct {
+		args   []string
+		code   int
+		stdout string
+	}{
+		{args: []string{"hosts"}},
+		{args: []string{"version"}},
+		{args: []string{"help"}},
+		{args: []string{"check", "web-prod"}},
+		{args: []string{"get", "web-prod", "a", "b"}},
+		{args: []string{"put", "web-prod", "a", "b"}, code: 1, stdout: "put\n"},
+	}
+	for _, c := range cases {
+		t.Run(strings.Join(c.args, " "), func(t *testing.T) {
+			code, stdout, stderr := runCLI(t, append([]string{"allow"}, c.args...)...)
+			if code != c.code || stdout != c.stdout {
+				t.Errorf("code=%d stdout=%q, want %d and %q; stderr=%q", code, stdout, c.code, c.stdout, stderr)
+			}
+		})
+	}
+}
+
+// TestAllowJudgesRunByItsCommand covers the one verdict the operator controls:
+// the Host's list replaces the defaults', the separator is optional, and no
+// flag on either side of the alias moves the answer.
+func TestAllowJudgesRunByItsCommand(t *testing.T) {
+	t.Setenv("ERRAND_CONFIG", "testdata/fixture.toml")
+	cases := []struct {
+		args   []string
+		code   int
+		stdout string
+	}{
+		{args: []string{"run", "lab", "--", "df", "-h"}},
+		{args: []string{"run", "lab", "--", "uptime"}},
+		{args: []string{"run", "lab", "--", "reboot"}, code: 1, stdout: "not on allowlist: reboot\n"},
+		{args: []string{"run", "web-prod", "--", "df"}, code: 1, stdout: "not on allowlist: df\n"},
+		{args: []string{"run", "web-prod", "--", "uptime"}},
+		{args: []string{"run", "lab", "df", "-h"}},
+		{args: []string{"run", "--json", "lab", "--quiet", "--timeout", "5s", "--stdin", "--env", "A=b", "--max-output", "1KiB", "--", "df", "-h"}},
+		{args: []string{"run", "--json", "lab", "--", "reboot"}, code: 1, stdout: "not on allowlist: reboot\n"},
+	}
+	for _, c := range cases {
+		t.Run(strings.Join(c.args, " "), func(t *testing.T) {
+			code, stdout, stderr := runCLI(t, append([]string{"allow"}, c.args...)...)
+			if code != c.code || stdout != c.stdout {
+				t.Errorf("code=%d stdout=%q, want %d and %q; stderr=%q", code, stdout, c.code, c.stdout, stderr)
+			}
+		})
+	}
+}
+
+func TestAllowEmptyListRefusesEverything(t *testing.T) {
+	p := t.TempDir() + "/config.toml"
+	body := "[defaults]\nallow_commands = [\"df\"]\n\n[hosts.h]\nhostname = \"h\"\nallow_commands = []\n"
+	if err := os.WriteFile(p, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("ERRAND_CONFIG", p)
+	code, stdout, stderr := runCLI(t, "allow", "run", "h", "--", "df")
+	if code != 1 || stdout != "not on allowlist: df\n" {
+		t.Errorf("code=%d stdout=%q, want 1 and the reason; stderr=%q", code, stdout, stderr)
+	}
+}
+
+func TestAllowExit250(t *testing.T) {
+	t.Setenv("ERRAND_CONFIG", "testdata/fixture.toml")
+	cases := map[string][]string{
+		"no subcommand":      {"allow"},
+		"unknown subcommand": {"allow", "frobnicate"},
+		"run missing host":   {"allow", "run"},
+		"unknown alias":      {"allow", "run", "ghost", "--", "df"},
+		"run missing":        {"allow", "run", "lab"},
+		"bad flag on run":    {"allow", "run", "--nope", "lab", "--", "df"},
+		"put missing remote": {"allow", "put", "lab", "a"},
+		"get extra path":     {"allow", "get", "lab", "a", "b", "c"},
+		"check takes no arg": {"allow", "check", "lab", "x"},
+		"bad flag on hosts":  {"allow", "hosts", "--nope"},
+	}
+	for name, args := range cases {
+		t.Run(name, func(t *testing.T) {
+			code, _, stderr := runCLI(t, args...)
+			if code != 250 || !strings.HasPrefix(stderr, "errand: ") {
+				t.Errorf("code=%d stderr=%q", code, stderr)
+			}
+		})
+	}
+	// The judged subcommand's envelope is its own output, never the verdict's.
+	if code, stdout, _ := runCLI(t, "allow", "run", "--json", "ghost", "--", "df"); code != 250 || stdout != "" {
+		t.Errorf("code=%d stdout=%q, want 250 and nothing on stdout", code, stdout)
+	}
+}
+
+// TestAllowIsSilentOnUnattended is what a harness reads: an Unattended verdict
+// is the exit code and nothing else, on either stream.
+func TestAllowIsSilentOnUnattended(t *testing.T) {
+	t.Setenv("ERRAND_CONFIG", "testdata/fixture.toml")
+	cases := [][]string{
+		{"allow", "hosts"},
+		{"allow", "version"},
+		{"allow", "help"},
+		{"allow", "check", "web-prod"},
+		{"allow", "get", "web-prod", "a", "b"},
+		{"allow", "run", "--json", "lab", "--", "df", "-h"},
+	}
+	for _, args := range cases {
+		t.Run(strings.Join(args, " "), func(t *testing.T) {
+			code, stdout, stderr := runCLI(t, args...)
+			if code != 0 || stdout != "" || stderr != "" {
+				t.Errorf("code=%d stdout=%q stderr=%q, want 0 and silence", code, stdout, stderr)
+			}
+		})
+	}
+}
+
+func TestAllowLeavesTheAuditLogUntouched(t *testing.T) {
+	t.Setenv("ERRAND_CONFIG", "testdata/fixture.toml")
+	state := t.TempDir()
+	t.Setenv("XDG_STATE_HOME", state)
+	for _, args := range [][]string{
+		{"allow", "run", "lab", "--", "df"},
+		{"allow", "run", "lab", "--", "reboot"},
+		{"allow", "put", "lab", "a", "b"},
+	} {
+		runCLI(t, args...)
+	}
+	entries, err := os.ReadDir(state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 0 {
+		t.Errorf("allow wrote %v into the state directory", entries)
+	}
+}

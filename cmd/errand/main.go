@@ -78,6 +78,8 @@ func run(args []string, stdout, stderr io.Writer) int {
 	case "version":
 		fmt.Fprintf(stdout, "errand %s\n", buildVersion())
 		return 0
+	case "allow":
+		return allow(rest, stdout, stderr)
 	case "hosts", "run", "put", "get", "check":
 	default:
 		return failUsage(stderr, diag, fmt.Errorf("unknown subcommand %q", sub))

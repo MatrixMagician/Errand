@@ -4,12 +4,14 @@ timeout         = "120s"
 max_output      = "1MiB"
 known_hosts     = "~/.ssh/known_hosts"
 identity_files  = ["~/.ssh/id_ed25519"]
+allow_commands  = ["df", "uptime"]
 
 [hosts.web-prod]
 hostname   = "web1.example.net"
 port       = 2222
 user       = "deploy"
 timeout    = "60s"
+allow_commands = ["uptime"]
 
 [hosts.lab]
 hostname   = "10.20.0.5"
