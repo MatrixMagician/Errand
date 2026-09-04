@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -153,14 +154,20 @@ func detectRuntime() string {
 }
 
 // sweepStale drops containers left behind by test processes that were killed
-// before their cleanup could run, so reruns converge.
+// before their reaper could run. The owning pid is in the name; a dead owner
+// means a stale container. This works the same on docker and podman, unlike
+// ps --filter until=, which only podman supports.
 func sweepStale(rt string) {
-	out, err := exec.Command(rt, "ps", "-aq", "--filter", "label="+label, "--filter", "until=1h").Output()
+	out, err := exec.Command(rt, "ps", "-a", "--filter", "label="+label, "--format", "{{.Names}}").Output()
 	if err != nil {
 		return
 	}
-	for _, id := range strings.Fields(string(out)) {
-		_ = exec.Command(rt, "rm", "-f", id).Run()
+	for _, name := range strings.Fields(string(out)) {
+		pid, err := strconv.Atoi(strings.TrimPrefix(name, "errand-sshtest-"))
+		if err != nil || pid == os.Getpid() || !errors.Is(syscall.Kill(pid, 0), syscall.ESRCH) {
+			continue
+		}
+		_ = exec.Command(rt, "rm", "-f", name).Run()
 	}
 }
 
