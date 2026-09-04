@@ -1399,6 +1399,7 @@ func TestIntegrationPutFailures(t *testing.T) {
 		want                string
 	}{
 		{"missing local file", filepath.Join(t.TempDir(), "absent"), dir + "/file", 250, "usage"},
+		{"local is a directory", t.TempDir(), dir + "/file", 250, "usage"},
 		{"missing remote directory", local, dir + "/absent/file", 253, "transfer"},
 		{"unwritable remote path", local, "/proc/nope/file", 253, "transfer"},
 	} {
