@@ -37,6 +37,9 @@ flags for run:
   --timeout <dur>                               wall-clock limit for the whole invocation
   --connect-timeout <dur>                       limit for TCP, handshake and auth, within --timeout
   --max-output <bytes>                          combined cap across stdout and stderr; 0 disables
+  --env KEY=VAL                                 set a remote environment variable; repeatable
+  --pty                                         request a PTY for tools that refuse to run without one
+  --quiet                                       suppress errand's own diagnostics, never the remote's
 
 <host> is an alias declared in the config file (default ~/.config/errand/config.toml,
 overridable with ERRAND_CONFIG). Exit 250 on usage or configuration errors.
@@ -49,7 +52,7 @@ func main() {
 // run dispatches args and returns the process exit code. Errand's own
 // diagnostics go to stderr prefixed "errand: " (SPEC §5.1).
 func run(args []string, stdout, stderr io.Writer) int {
-	diag := diagnostics(stderr)
+	diag := diagnostics(stderr, false)
 	if len(args) == 0 {
 		return failUsage(stderr, diag, errors.New("missing subcommand"))
 	}
@@ -69,11 +72,15 @@ func run(args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("errand "+sub, flag.ContinueOnError)
 	fs.SetOutput(io.Discard) // we print errors ourselves with the errand: prefix
 	fs.Usage = func() {}     // printed by us: on -h below, never on a parse error
-	var stdin bool
+	var stdin, pty, quiet bool
+	var env envFlag
 	var timeout, connectTimeout time.Duration
 	var maxOutput int64
 	if sub == "run" {
 		fs.BoolVar(&stdin, "stdin", false, "stream local stdin to the remote command")
+		fs.BoolVar(&pty, "pty", false, "request a PTY")
+		fs.BoolVar(&quiet, "quiet", false, "suppress errand's own diagnostics")
+		fs.Var(&env, "env", "KEY=VAL to set on the remote command; repeatable")
 		fs.DurationVar(&timeout, "timeout", 0, "wall-clock limit for the whole invocation")
 		fs.DurationVar(&connectTimeout, "connect-timeout", defaultConnectTimeout, "limit for TCP, handshake and auth")
 		fs.Func("max-output", "combined cap across stdout and stderr; 0 disables", func(v string) error {
@@ -106,6 +113,9 @@ func run(args []string, stdout, stderr io.Writer) int {
 	if err := fs.Parse(fs.Args()[1:]); err != nil {
 		return fail(diag, result.Usage, "", fmt.Errorf("%s: %v", sub, err))
 	}
+	// Only now is --quiet known. Everything above it is a usage error, which
+	// is the one diagnostic an operator needs whether they asked for it or not.
+	diag = diagnostics(stderr, quiet)
 	h, err := cfg.Resolve(alias)
 	if err != nil {
 		return fail(diag, result.Resolve, alias, err)
@@ -132,7 +142,8 @@ func run(args []string, stdout, stderr io.Writer) int {
 	defer stop()
 	res := attempt(ctx, h, timeout, connectTimeout, diag, func(ctx context.Context, c *client.Conn) result.Result {
 		return exec.Run(ctx, c, exec.Request{
-			Command: command, Stdin: in, Stdout: stdout, Stderr: stderr, MaxOutput: maxOutput,
+			Command: command, Stdin: in, Stdout: stdout, Stderr: stderr,
+			MaxOutput: maxOutput, Env: env, PTY: pty,
 		})
 	})
 	res.Op = "run"
@@ -220,10 +231,30 @@ func failUsage(stderr io.Writer, diag client.Diag, err error) int {
 	return code
 }
 
-func diagnostics(w io.Writer) client.Diag {
+// diagnostics builds the sink for errand's own stderr lines. --quiet silences
+// this sink only: the remote command's stderr is a stream, not a diagnostic,
+// and never passes through here.
+func diagnostics(w io.Writer, quiet bool) client.Diag {
+	if quiet {
+		return func(string, ...any) {}
+	}
 	return func(format string, args ...any) {
 		fmt.Fprintf(w, "errand: "+format+"\n", args...)
 	}
+}
+
+// envFlag collects repeated --env values. The KEY=VAL shape is checked here,
+// at the boundary, so exec can split on the first "=" and trust the result.
+type envFlag []string
+
+func (e *envFlag) String() string { return strings.Join(*e, " ") }
+
+func (e *envFlag) Set(v string) error {
+	if _, _, ok := strings.Cut(v, "="); !ok {
+		return fmt.Errorf("want KEY=VAL, got %q", v)
+	}
+	*e = append(*e, v)
+	return nil
 }
 
 func hosts(cfg *config.File, stdout io.Writer, diag client.Diag) int {
