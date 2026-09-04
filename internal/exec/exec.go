@@ -7,6 +7,8 @@ import (
 	"context"
 	"errors"
 	"io"
+	"sync/atomic"
+	"time"
 
 	"github.com/MatrixMagician/Errand/internal/client"
 	"github.com/MatrixMagician/Errand/internal/result"
@@ -64,10 +66,76 @@ func Run(ctx context.Context, c *client.Conn, req Request) result.Result {
 		r.Err = result.Exec.Wrap(alias, err)
 		return r
 	}
-	// ticket #5: ctx and the cap breach select against Wait here, then tear down.
-	r.Remote, r.Err = fromWait(alias, sess.Wait())
-	r.StdoutBytes, r.StderrBytes = out.n, errOut.n
+	waitC := make(chan error, 1)
+	go func() { waitC <- sess.Wait() }()
+
+	// ticket #6 adds a third case here for the cap breach, with onCap true.
+	select {
+	case werr := <-waitC:
+		r.Remote, r.Err = fromWait(alias, werr)
+	case <-ctx.Done():
+		r.Err = result.StopCause(ctx)
+		teardown(c, sess, waitC, false)
+	}
+	r.StdoutBytes, r.StderrBytes = out.n.Load(), errOut.n.Load()
 	return r
+}
+
+// Graces bounding teardown. Their sum is the worst case an operator waits for
+// after a timeout, cancellation or cap breach.
+const (
+	killGrace     = 200 * time.Millisecond
+	teardownGrace = 2 * time.Second
+	flushGrace    = time.Second
+)
+
+// teardown ends a session that is still running and returns the remote's own
+// exit status when one arrives in time. It is bounded whatever the server does.
+func teardown(c *client.Conn, sess *ssh.Session, waitC <-chan error, onCap bool) *result.Remote {
+	select {
+	case err := <-waitC:
+		return remoteOf(c, err)
+	default:
+	}
+
+	// Fire and forget: a wedged transport blocks these writes indefinitely,
+	// and the SSH signal request is a courtesy many servers ignore anyway.
+	go func() { _ = sess.Signal(ssh.SIGKILL) }()
+	go func() { _ = sess.Close() }()
+
+	// Only a cap breach lets the remote's own code win (SPEC 5.4), so only it
+	// pays for the wait.
+	if onCap {
+		if err, ok := waitWithin(waitC, killGrace); ok {
+			return remoteOf(c, err)
+		}
+	}
+
+	// Abort's socket deadline is the guarantee that everything above unblocks.
+	c.Abort(teardownGrace)
+	err, ok := waitWithin(waitC, flushGrace)
+	if ok && onCap {
+		return remoteOf(c, err)
+	}
+	return nil
+}
+
+func waitWithin(waitC <-chan error, d time.Duration) (error, bool) {
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case err := <-waitC:
+		return err, true
+	case <-timer.C:
+		return nil, false
+	}
+}
+
+// remoteOf keeps only the exit status from a Wait: the stop cause already in
+// the Result outranks whatever the dying connection reported.
+func remoteOf(c *client.Conn, err error) *result.Remote {
+	remote, _ := fromWait(c.Host.Alias, err)
+	return remote
 }
 
 // fromWait turns x/crypto's Wait error into an exit status, or into an exec
@@ -83,15 +151,15 @@ func fromWait(alias string, err error) (*result.Remote, error) {
 	return nil, result.Exec.Wrap(alias, err)
 }
 
-// counter forwards bytes and records how many. Wait joins the copier that
-// writes here, so n is final once Wait has returned.
+// counter forwards bytes and records how many. The count is atomic because
+// teardown reads it on a bounded wait: the copier may still be running.
 type counter struct {
 	w io.Writer
-	n int64
+	n atomic.Int64
 }
 
 func (c *counter) Write(p []byte) (int, error) {
 	n, err := c.w.Write(p)
-	c.n += int64(n)
+	c.n.Add(int64(n))
 	return n, err
 }

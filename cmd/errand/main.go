@@ -8,8 +8,10 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/signal"
 	"runtime/debug"
 	"strings"
+	"syscall"
 	"text/tabwriter"
 	"time"
 
@@ -32,6 +34,8 @@ const usage = `usage:
 
 flags for run:
   --stdin                                       stream local stdin to the remote command
+  --timeout <dur>                               wall-clock limit for the whole invocation
+  --connect-timeout <dur>                       limit for TCP, handshake and auth, within --timeout
 
 <host> is an alias declared in the config file (default ~/.config/errand/config.toml,
 overridable with ERRAND_CONFIG). Exit 250 on usage or configuration errors.
@@ -65,8 +69,11 @@ func run(args []string, stdout, stderr io.Writer) int {
 	fs.SetOutput(io.Discard) // we print errors ourselves with the errand: prefix
 	fs.Usage = func() {}     // printed by us: on -h below, never on a parse error
 	var stdin bool
+	var timeout, connectTimeout time.Duration
 	if sub == "run" {
 		fs.BoolVar(&stdin, "stdin", false, "stream local stdin to the remote command")
+		fs.DurationVar(&timeout, "timeout", 0, "wall-clock limit for the whole invocation")
+		fs.DurationVar(&connectTimeout, "connect-timeout", defaultConnectTimeout, "limit for TCP, handshake and auth")
 	}
 	if err := fs.Parse(rest); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
@@ -108,18 +115,69 @@ func run(args []string, stdout, stderr io.Writer) int {
 	if stdin {
 		in = os.Stdin
 	}
-	res := attempt(context.Background(), h, diag, func(ctx context.Context, c *client.Conn) result.Result {
+	if !given(fs, "timeout") {
+		timeout = h.Timeout
+	}
+	ctx, stop := interruptible(context.Background())
+	defer stop()
+	res := attempt(ctx, h, timeout, connectTimeout, diag, func(ctx context.Context, c *client.Conn) result.Result {
 		return exec.Run(ctx, c, exec.Request{Command: command, Stdin: in, Stdout: stdout, Stderr: stderr})
 	})
 	res.Op = "run"
 	return finish(res, diag)
 }
 
+// defaultConnectTimeout bounds TCP, handshake and auth (SPEC 4.1). Unlike
+// --timeout it has no per-host setting, so the built-in is the only default.
+const defaultConnectTimeout = 10 * time.Second
+
+// given reports whether the flag was set on the command line, which is how
+// "flag overrides configuration" is decided for a flag whose zero value is
+// indistinguishable from an explicit one.
+func given(fs *flag.FlagSet, name string) bool {
+	set := false
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == name {
+			set = true
+		}
+	})
+	return set
+}
+
+// budgets derives the two deadlines. The connect deadline is a child of the
+// total one, so it can only ever be the earlier of the two: connect time is
+// spent inside the invocation's budget, never on top of it.
+func budgets(ctx context.Context, total, connect time.Duration) (context.Context, context.Context, func()) {
+	run, cancelRun := context.WithTimeoutCause(ctx, total, result.ErrTimeout)
+	dial, cancelDial := context.WithTimeoutCause(run, connect, result.ErrTimeout)
+	return run, dial, func() { cancelDial(); cancelRun() }
+}
+
+// interruptible cancels ctx when errand itself is signalled, recording which
+// signal so the exit code can be 128+n rather than a timeout's 254.
+func interruptible(ctx context.Context) (context.Context, func()) {
+	ctx, cancel := context.WithCancelCause(ctx)
+	ch := make(chan os.Signal, 1)
+	signal.Notify(ch, syscall.SIGINT, syscall.SIGTERM)
+	go func() {
+		if sig, ok := <-ch; ok {
+			cancel(result.Interrupt{Signal: sig.(syscall.Signal)})
+		}
+	}()
+	return ctx, func() {
+		signal.Stop(ch)
+		close(ch)
+		cancel(context.Canceled)
+	}
+}
+
 // attempt connects, runs body, and fills in what only the caller knows.
-func attempt(ctx context.Context, h config.Host, diag client.Diag, body func(context.Context, *client.Conn) result.Result) result.Result {
+func attempt(ctx context.Context, h config.Host, timeout, connect time.Duration, diag client.Diag, body func(context.Context, *client.Conn) result.Result) result.Result {
 	start := time.Now()
 	target := fmt.Sprintf("%s@%s:%d", h.User, h.Hostname, h.Port)
-	conn, err := client.Dial(ctx, h, diag)
+	ctx, dctx, cancel := budgets(ctx, timeout, connect)
+	defer cancel()
+	conn, err := client.Dial(dctx, h, diag)
 	if err != nil {
 		return result.Result{Host: h.Alias, Target: target, Err: err, Elapsed: time.Since(start)}
 	}

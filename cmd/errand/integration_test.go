@@ -4,11 +4,14 @@ import (
 	"crypto/ed25519"
 	"encoding/pem"
 	"fmt"
+	"io"
 	"net"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -23,6 +26,7 @@ type hostConfig struct {
 	identities []string
 	hostname   string
 	port       int
+	timeout    string
 }
 
 func writeConfig(t *testing.T, s *sshtest.Server, o hostConfig) string {
@@ -40,6 +44,10 @@ func writeConfig(t *testing.T, s *sshtest.Server, o hostConfig) string {
 	for i, p := range o.identities {
 		quoted[i] = strconv.Quote(p)
 	}
+	timeout := ""
+	if o.timeout != "" {
+		timeout = fmt.Sprintf("timeout  = %q\n", o.timeout)
+	}
 	dir := t.TempDir()
 	kh := sshtest.WriteFile(t, dir, "known_hosts", o.knownHosts)
 	return sshtest.WriteFile(t, dir, "config.toml", fmt.Sprintf(`[defaults]
@@ -50,7 +58,7 @@ identity_files = [%s]
 [hosts.h]
 hostname = %q
 port     = %d
-`, kh, strings.Join(quoted, ", "), o.hostname, o.port))
+%s`, kh, strings.Join(quoted, ", "), o.hostname, o.port, timeout))
 }
 
 // trusting is the configuration in which everything should work.
@@ -275,4 +283,181 @@ func dial(s *sshtest.Server, key sshtest.Key) (*ssh.Client, error) {
 		HostKeyCallback: ssh.FixedHostKey(s.HostKey),
 		Timeout:         10 * time.Second,
 	})
+}
+
+// timed runs errand and reports how long the process took, so a test can prove
+// "promptly" rather than merely "eventually".
+func timed(t *testing.T, cfg string, args ...string) (int, string, time.Duration) {
+	t.Helper()
+	start := time.Now()
+	code, _, stderr := errand(t, cfg, "", args...)
+	took := time.Since(start)
+	t.Logf("%v -> exit %d in %v, stderr: %s", args, code, took, stderr)
+	return code, stderr, took
+}
+
+// startErrand launches the binary and returns once the remote command has
+// announced itself on stdout, so a test can act while it is genuinely running.
+// The command must begin with "echo started".
+func startErrand(t *testing.T, cfg string, args ...string) (*exec.Cmd, *strings.Builder) {
+	t.Helper()
+	cmd := exec.Command(sshtest.Binary(t), args...)
+	cmd.Env = append(os.Environ(), "ERRAND_CONFIG="+cfg, "SSH_AUTH_SOCK=")
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	stderr := &strings.Builder{}
+	cmd.Stderr = stderr
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := io.ReadFull(stdout, make([]byte, len("started\n"))); err != nil {
+		t.Fatalf("waiting for the remote command to start: %v; stderr: %s", err, stderr)
+	}
+	return cmd, stderr
+}
+
+func TestIntegrationRunTimeout(t *testing.T) {
+	s := sshtest.Start(t)
+	code, stderr, took := timed(t, trusting(t, s), "run", "h", "--timeout", "2s", "--", "sleep 30")
+	if code != 254 {
+		t.Errorf("code=%d, want 254", code)
+	}
+	if !strings.Contains(stderr, "errand: ") || !strings.Contains(stderr, "timeout") {
+		t.Errorf("stderr=%q, want an errand timeout diagnostic", stderr)
+	}
+	if took > 4*time.Second {
+		t.Errorf("took %v, want the 2s budget plus teardown", took)
+	}
+}
+
+// TestIntegrationRunTimeoutTeardownIsPrompt is the "server ignores KILL" case.
+// The container's sshd honours signals, so the worst case is staged at the
+// transport instead: once the proxy freezes, the KILL request goes nowhere and
+// no exit status can arrive, leaving Abort's socket deadline as the only thing
+// that ends the run.
+func TestIntegrationRunTimeoutTeardownIsPrompt(t *testing.T) {
+	s := sshtest.Start(t)
+	p := newFreezingProxy(t, s.Addr)
+	cfg := writeConfig(t, s, hostConfig{
+		knownHosts: fmt.Sprintf("[127.0.0.1]:%d %s\n", p.Port, strings.TrimSpace(string(ssh.MarshalAuthorizedKey(s.HostKey)))),
+		port:       p.Port,
+	})
+	cmd, stderr := startErrand(t, cfg, "run", "h", "--timeout", "2s", "--", "echo started; sleep 30")
+	p.Freeze()
+	start := time.Now()
+	err := cmd.Wait()
+	took := time.Since(start)
+	t.Logf("exit %d in %v after the transport froze, stderr: %s", cmd.ProcessState.ExitCode(), took, stderr)
+	if code := cmd.ProcessState.ExitCode(); code != 254 {
+		t.Errorf("code=%d (%v), want 254", code, err)
+	}
+	// The 2s budget, then the 2s teardown and 1s flush graces, doubled for CI.
+	if took > 10*time.Second {
+		t.Errorf("took %v: teardown waited on a server that can never answer", took)
+	}
+}
+
+func TestIntegrationRunConnectTimeout(t *testing.T) {
+	s := sshtest.Start(t)
+	// An address in the unrouted RFC 1918 range: packets are dropped, so the
+	// TCP handshake never completes and only the deadline ends the dial.
+	cfg := writeConfig(t, s, hostConfig{knownHosts: s.KnownHostsLine() + "\n", hostname: "10.255.255.1", port: 22})
+	code, stderr, took := timed(t, cfg, "run", "h", "--connect-timeout", "1s", "--", "true")
+	if code != 254 {
+		t.Errorf("code=%d, want 254 (253 means the dial failed for another reason)", code)
+	}
+	if !strings.Contains(stderr, "timeout") {
+		t.Errorf("stderr=%q, want a timeout diagnostic", stderr)
+	}
+	if took > 3*time.Second {
+		t.Errorf("took %v, want the 1s connect budget", took)
+	}
+}
+
+func TestIntegrationRunCancelledBySIGINT(t *testing.T) {
+	s := sshtest.Start(t)
+	cmd, stderr := startErrand(t, trusting(t, s), "run", "h", "--", "echo started; sleep 30")
+	start := time.Now()
+	if err := cmd.Process.Signal(syscall.SIGINT); err != nil {
+		t.Fatal(err)
+	}
+	err := cmd.Wait()
+	took := time.Since(start)
+	t.Logf("exit %d in %v after SIGINT, stderr: %s", cmd.ProcessState.ExitCode(), took, stderr)
+	if code := cmd.ProcessState.ExitCode(); code != 130 {
+		t.Errorf("code=%d (%v), want 130", code, err)
+	}
+	if !strings.Contains(stderr.String(), "cancelled") {
+		t.Errorf("stderr=%q, want a cancelled diagnostic", stderr)
+	}
+	if took > 3*time.Second {
+		t.Errorf("took %v to exit after SIGINT", took)
+	}
+}
+
+func TestIntegrationRunPerHostTimeout(t *testing.T) {
+	s := sshtest.Start(t)
+	cfg := writeConfig(t, s, hostConfig{knownHosts: s.KnownHostsLine() + "\n", timeout: "1s"})
+	if code, _, took := timed(t, cfg, "run", "h", "--", "sleep 30"); code != 254 || took > 3*time.Second {
+		t.Errorf("per-host timeout: code=%d took=%v, want 254 promptly", code, took)
+	}
+	if code, _, took := timed(t, cfg, "run", "h", "--timeout", "5s", "--", "sleep 2"); code != 0 {
+		t.Errorf("flag overriding the per-host timeout: code=%d took=%v, want 0", code, took)
+	}
+}
+
+// freezingProxy forwards one TCP connection to addr until Freeze, then goes
+// silent in both directions. It never closes the frozen connection: that a
+// hung peer stays open is exactly what teardown has to survive.
+type freezingProxy struct {
+	Port   int
+	frozen chan struct{}
+}
+
+func newFreezingProxy(t *testing.T, addr string) *freezingProxy {
+	t.Helper()
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = l.Close() })
+	p := &freezingProxy{Port: l.Addr().(*net.TCPAddr).Port, frozen: make(chan struct{})}
+	go func() {
+		down, err := l.Accept()
+		if err != nil {
+			return
+		}
+		up, err := net.Dial("tcp", addr)
+		if err != nil {
+			_ = down.Close()
+			return
+		}
+		go p.pipe(down, up)
+		go p.pipe(up, down)
+	}()
+	return p
+}
+
+func (p *freezingProxy) Freeze() { close(p.frozen) }
+
+func (p *freezingProxy) pipe(dst, src net.Conn) {
+	buf := make([]byte, 32*1024)
+	for {
+		n, err := src.Read(buf)
+		select {
+		case <-p.frozen:
+			return
+		default:
+		}
+		if n > 0 {
+			if _, err := dst.Write(buf[:n]); err != nil {
+				return
+			}
+		}
+		if err != nil {
+			return
+		}
+	}
 }
