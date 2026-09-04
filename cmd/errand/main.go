@@ -101,7 +101,9 @@ func hosts(cfg *config.File, stdout io.Writer) int {
 		fmt.Fprintf(tw, "%s\t%s\t%d\t%s\t%s\t%s\t%s\t%s\n",
 			h.Alias, h.Hostname, h.Port, h.User, h.Timeout, h.MaxOutput, yesNo(h.AcceptNew), pinned(h.HostKey))
 	}
-	tw.Flush()
+	if err := tw.Flush(); err != nil {
+		return exitUsage
+	}
 	return 0
 }
 
