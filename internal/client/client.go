@@ -119,18 +119,65 @@ func dial(ctx context.Context, h config.Host, diag Diag) (*Conn, error) {
 		}
 		return nil, result.Connect.Wrap(h.Alias, err)
 	}
+	client := ssh.NewClient(sc, chans, reqs)
 	return &Conn{
-		Client:  ssh.NewClient(sc, chans, reqs),
+		Client:  client,
 		Host:    h,
 		Connect: time.Since(start),
 		raw:     raw,
+		stopKA:  keepalive(client, raw),
 	}, nil
+}
+
+// keepaliveInterval is how often both keepalives fire. It is a variable so a
+// test can shorten it; SPEC §11 fixes the shipped value at 30s.
+var keepaliveInterval = 30 * time.Second
+
+// sendKeepalive is a variable for the same reason: it is the only place a test
+// can observe that the request really went out. sshd does not implement this
+// request and answers it with a failure, which is still proof that the
+// connection carried it and the server was alive to answer.
+var sendKeepalive = func(c ssh.Conn) error {
+	_, _, err := c.SendRequest("keepalive@openssh.com", true, nil)
+	return err
+}
+
+// keepalive holds the connection open through stateful firewalls that drop
+// idle NAT entries mid-command: TCP at the socket, and an SSH global request
+// above it for middleboxes that only count application traffic. It returns the
+// stop function, which is safe to call more than once.
+func keepalive(c ssh.Conn, raw net.Conn) func() {
+	// Both are read once here rather than in the loop, so a test swapping
+	// them back has nothing left to race with.
+	send, every := sendKeepalive, keepaliveInterval
+	if tcp, ok := raw.(*net.TCPConn); ok {
+		_ = tcp.SetKeepAlive(true)
+		_ = tcp.SetKeepAlivePeriod(every)
+	}
+	done := make(chan struct{})
+	go func() {
+		t := time.NewTicker(every)
+		defer t.Stop()
+		for {
+			select {
+			case <-t.C:
+				// A failed request means the connection is already
+				// going; whatever is using it will report that.
+				_ = send(c)
+			case <-done:
+				return
+			}
+		}
+	}()
+	var once sync.Once
+	return func() { once.Do(func() { close(done) }) }
 }
 
 // Abort forces the connection down without blocking: the socket deadline is
 // the guarantee, closing the client is the courtesy.
 func (c *Conn) Abort(grace time.Duration) {
 	c.abortOnce.Do(func() {
+		c.stopKA()
 		_ = c.raw.SetDeadline(time.Now().Add(grace))
 		_ = c.Client.Close()
 	})
@@ -138,9 +185,7 @@ func (c *Conn) Abort(grace time.Duration) {
 
 // Close stops the keepalive loop and closes the connection.
 func (c *Conn) Close() error {
-	if c.stopKA != nil {
-		c.stopKA()
-	}
+	c.stopKA()
 	return c.Client.Close()
 }
 
