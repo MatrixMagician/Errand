@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"syscall"
@@ -723,5 +724,75 @@ func TestIntegrationRunQuiet(t *testing.T) {
 	code, _, stderr = errand(t, trusting(t, s), "", "run", "h", "--quiet", "--", "echo err >&2")
 	if code != 0 || stderr != "err\n" {
 		t.Errorf("remote stderr: code=%d stderr=%q, want 0 and %q", code, stderr, "err\n")
+	}
+}
+
+func TestIntegrationCheckSucceeds(t *testing.T) {
+	s := sshtest.Start(t)
+	code, stdout, stderr := errand(t, trusting(t, s), "", "check", "h")
+	t.Logf("stderr: %s", stderr)
+	if code != 0 {
+		t.Fatalf("code=%d, want 0; stderr=%q", code, stderr)
+	}
+	if stdout != "" {
+		t.Errorf("stdout=%q, want nothing: check discards the remote's streams", stdout)
+	}
+	want := regexp.MustCompile(fmt.Sprintf(`^errand: ok root@127\.0\.0\.1:%d connect=\d+ms\n$`, s.Port))
+	if !want.MatchString(stderr) {
+		t.Errorf("stderr=%q, want a line matching %v", stderr, want)
+	}
+}
+
+// TestIntegrationCheckFailsLikeRun is the ticket's promise: a 251 or 252 from
+// check tells the agent exactly what run would have said, so the preflight can
+// be trusted in place of the real thing.
+func TestIntegrationCheckFailsLikeRun(t *testing.T) {
+	s := sshtest.Start(t)
+	cases := []struct {
+		name string
+		cfg  hostConfig
+		want int
+	}{
+		{"unknown host key", hostConfig{}, 251},
+		{"wrong client key", hostConfig{knownHosts: s.KnownHostsLine() + "\n", identities: []string{s.RejectedKey.Path}}, 252},
+		{"refused", hostConfig{knownHosts: s.KnownHostsLine() + "\n", port: closedPort(t)}, 253},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			cfg := writeConfig(t, s, c.cfg)
+			code, _, stderr := errand(t, cfg, "", "check", "h")
+			t.Logf("stderr: %s", stderr)
+			runCode, _, runStderr := errand(t, cfg, "", "run", "h", "--", "true")
+			if code != c.want || runCode != c.want {
+				t.Errorf("check exited %d and run exited %d, want %d both; stderr=%q", code, runCode, c.want, stderr)
+			}
+			if stderr != runStderr {
+				t.Errorf("check said %q, run said %q", stderr, runStderr)
+			}
+		})
+	}
+}
+
+func TestIntegrationCheckConnectTimeout(t *testing.T) {
+	s := sshtest.Start(t)
+	cfg := writeConfig(t, s, hostConfig{knownHosts: s.KnownHostsLine() + "\n", hostname: "10.255.255.1", port: 22})
+	code, stderr, took := timed(t, cfg, "check", "h", "--connect-timeout", "1s")
+	if code != 254 {
+		t.Errorf("code=%d, want 254 (253 means the dial failed for another reason)", code)
+	}
+	if !strings.Contains(stderr, "timeout") {
+		t.Errorf("stderr=%q, want a timeout diagnostic", stderr)
+	}
+	if took > 3*time.Second {
+		t.Errorf("took %v, want the 1s connect budget", took)
+	}
+}
+
+func TestIntegrationCheckUnknownAlias(t *testing.T) {
+	s := sshtest.Start(t)
+	code, _, stderr := errand(t, trusting(t, s), "", "check", "ghost")
+	t.Logf("stderr: %s", stderr)
+	if code != 250 || !strings.Contains(stderr, `"ghost"`) {
+		t.Errorf("code=%d, want 250 naming the alias; stderr=%q", code, stderr)
 	}
 }
