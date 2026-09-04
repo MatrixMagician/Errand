@@ -36,6 +36,7 @@ flags for run:
   --stdin                                       stream local stdin to the remote command
   --timeout <dur>                               wall-clock limit for the whole invocation
   --connect-timeout <dur>                       limit for TCP, handshake and auth, within --timeout
+  --max-output <bytes>                          combined cap across stdout and stderr; 0 disables
 
 <host> is an alias declared in the config file (default ~/.config/errand/config.toml,
 overridable with ERRAND_CONFIG). Exit 250 on usage or configuration errors.
@@ -70,10 +71,16 @@ func run(args []string, stdout, stderr io.Writer) int {
 	fs.Usage = func() {}     // printed by us: on -h below, never on a parse error
 	var stdin bool
 	var timeout, connectTimeout time.Duration
+	var maxOutput int64
 	if sub == "run" {
 		fs.BoolVar(&stdin, "stdin", false, "stream local stdin to the remote command")
 		fs.DurationVar(&timeout, "timeout", 0, "wall-clock limit for the whole invocation")
 		fs.DurationVar(&connectTimeout, "connect-timeout", defaultConnectTimeout, "limit for TCP, handshake and auth")
+		fs.Func("max-output", "combined cap across stdout and stderr; 0 disables", func(v string) error {
+			var err error
+			maxOutput, err = config.ParseSize(v)
+			return err
+		})
 	}
 	if err := fs.Parse(rest); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
@@ -118,10 +125,15 @@ func run(args []string, stdout, stderr io.Writer) int {
 	if !given(fs, "timeout") {
 		timeout = h.Timeout
 	}
+	if !given(fs, "max-output") {
+		maxOutput = int64(h.MaxOutput)
+	}
 	ctx, stop := interruptible(context.Background())
 	defer stop()
 	res := attempt(ctx, h, timeout, connectTimeout, diag, func(ctx context.Context, c *client.Conn) result.Result {
-		return exec.Run(ctx, c, exec.Request{Command: command, Stdin: in, Stdout: stdout, Stderr: stderr})
+		return exec.Run(ctx, c, exec.Request{
+			Command: command, Stdin: in, Stdout: stdout, Stderr: stderr, MaxOutput: maxOutput,
+		})
 	})
 	res.Op = "run"
 	return finish(res, diag)

@@ -50,6 +50,7 @@ func TestExit250(t *testing.T) {
 		"bad flag on run":       {"run", "--nope", "web-prod", "--", "true"},
 		"run missing host":      {"run"},
 		"run missing command":   {"run", "web-prod"},
+		"unparseable size":      {"run", "web-prod", "--max-output", "1GB", "--", "true"},
 		"put not implemented":   {"put", "web-prod", "a", "b"},
 		"get not implemented":   {"get", "web-prod", "a", "b"},
 		"check not implemented": {"check", "web-prod"},
