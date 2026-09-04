@@ -28,6 +28,8 @@ type hostConfig struct {
 	port       int
 	timeout    string
 	maxOutput  string
+	acceptNew  bool
+	hostKey    string
 }
 
 func writeConfig(t *testing.T, s *sshtest.Server, o hostConfig) string {
@@ -51,6 +53,12 @@ func writeConfig(t *testing.T, s *sshtest.Server, o hostConfig) string {
 	}
 	if o.maxOutput != "" {
 		settings += fmt.Sprintf("max_output = %q\n", o.maxOutput)
+	}
+	if o.acceptNew {
+		settings += "accept_new = true\n"
+	}
+	if o.hostKey != "" {
+		settings += fmt.Sprintf("host_key   = %q\n", o.hostKey)
 	}
 	dir := t.TempDir()
 	kh := sshtest.WriteFile(t, dir, "known_hosts", o.knownHosts)
@@ -161,6 +169,108 @@ func TestIntegrationRunChangedHostKey(t *testing.T) {
 	t.Logf("stderr: %s", stderr)
 	if code != 251 || !strings.Contains(stderr, "changed") {
 		t.Errorf("code=%d, want 251; stderr=%q", code, stderr)
+	}
+}
+
+// knownHostsPath is the file writeConfig put beside the config it returned.
+func knownHostsPath(cfg string) string {
+	return filepath.Join(filepath.Dir(cfg), "known_hosts")
+}
+
+func authorizedKey(key ssh.PublicKey) string {
+	return strings.TrimSpace(string(ssh.MarshalAuthorizedKey(key)))
+}
+
+func readFile(t *testing.T, path string) string {
+	t.Helper()
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(b)
+}
+
+func TestIntegrationRunAcceptNew(t *testing.T) {
+	s := sshtest.Start(t)
+	cfg := writeConfig(t, s, hostConfig{acceptNew: true})
+	kh := knownHostsPath(cfg)
+
+	code, _, stderr := errand(t, cfg, "", "run", "h", "--", "true")
+	t.Logf("stderr: %s", stderr)
+	if code != 0 || !strings.Contains(stderr, "accept_new") {
+		t.Fatalf("code=%d, want 0 with an accept_new note; stderr=%q", code, stderr)
+	}
+	recorded := readFile(t, kh)
+	if want := s.KnownHostsLine() + "\n"; recorded != want {
+		t.Errorf("known_hosts = %q, want %q", recorded, want)
+	}
+
+	// The key is known now, so the second run is an ordinary trusting run.
+	code, _, stderr = errand(t, cfg, "", "run", "h", "--", "true")
+	if code != 0 || strings.Contains(stderr, "accept_new") {
+		t.Errorf("second run: code=%d, want 0 with no note; stderr=%q", code, stderr)
+	}
+	if again := readFile(t, kh); again != recorded {
+		t.Errorf("known_hosts changed on the second run: %q, want %q", again, recorded)
+	}
+}
+
+// TestIntegrationRunAcceptNewChangedKey is the one refusal with no override:
+// accept_new records a key nobody has seen, never one that changed.
+func TestIntegrationRunAcceptNewChangedKey(t *testing.T) {
+	s := sshtest.Start(t)
+	before := s.WrongKnownHostsLine() + "\n"
+	cfg := writeConfig(t, s, hostConfig{acceptNew: true, knownHosts: before})
+	code, _, stderr := errand(t, cfg, "", "run", "h", "--", "true")
+	t.Logf("stderr: %s", stderr)
+	if code != 251 || !strings.Contains(stderr, "changed") {
+		t.Errorf("code=%d, want 251 for a changed key; stderr=%q", code, stderr)
+	}
+	if after := readFile(t, knownHostsPath(cfg)); after != before {
+		t.Errorf("known_hosts = %q, want it untouched at %q", after, before)
+	}
+}
+
+func TestIntegrationRunPinnedHostKey(t *testing.T) {
+	s := sshtest.Start(t)
+	cases := []struct {
+		name       string
+		hostKey    string
+		knownHosts string
+		code       int
+		diagnostic string
+	}{
+		{"matching pin needs no known_hosts", authorizedKey(s.HostKey), "", 0, ""},
+		{"mismatched pin beats a trusting known_hosts", authorizedKey(s.ClientKey.Public), s.KnownHostsLine() + "\n", 251, "pin"},
+		{"malformed pin", "not-a-key", s.KnownHostsLine() + "\n", 250, "host_key"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			cfg := writeConfig(t, s, hostConfig{hostKey: c.hostKey, knownHosts: c.knownHosts})
+			code, _, stderr := errand(t, cfg, "", "run", "h", "--", "true")
+			t.Logf("stderr: %s", stderr)
+			if code != c.code {
+				t.Errorf("code=%d, want %d; stderr=%q", code, c.code, stderr)
+			}
+			if c.diagnostic != "" && !strings.Contains(stderr, c.diagnostic) {
+				t.Errorf("stderr=%q, want it to mention %q", stderr, c.diagnostic)
+			}
+		})
+	}
+}
+
+func TestIntegrationHostsShowsHostKeyPolicy(t *testing.T) {
+	s := sshtest.Start(t)
+	cfg := writeConfig(t, s, hostConfig{acceptNew: true, hostKey: authorizedKey(s.HostKey)})
+	code, stdout, stderr := errand(t, cfg, "", "hosts")
+	if code != 0 {
+		t.Fatalf("errand hosts exited %d, stderr: %s", code, stderr)
+	}
+	t.Logf("stdout:\n%s", stdout)
+	for _, want := range []string{"ACCEPT_NEW", "HOST_KEY", "yes", s.HostKey.Type() + " (pinned)"} {
+		if !strings.Contains(stdout, want) {
+			t.Errorf("errand hosts stdout missing %q:\n%s", want, stdout)
+		}
 	}
 }
 
