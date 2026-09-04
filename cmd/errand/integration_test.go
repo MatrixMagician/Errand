@@ -32,6 +32,7 @@ type hostConfig struct {
 	maxOutput  string
 	acceptNew  bool
 	hostKey    string
+	auditLog   string
 }
 
 func writeConfig(t *testing.T, s *sshtest.Server, o hostConfig) string {
@@ -63,16 +64,22 @@ func writeConfig(t *testing.T, s *sshtest.Server, o hostConfig) string {
 		settings += fmt.Sprintf("host_key   = %q\n", o.hostKey)
 	}
 	dir := t.TempDir()
+	// Every config names an audit log inside its own temp dir. Left unset, a
+	// run would append to the developer's own ~/.local/state log instead.
+	if o.auditLog == "" {
+		o.auditLog = filepath.Join(dir, "audit.jsonl")
+	}
 	kh := sshtest.WriteFile(t, dir, "known_hosts", o.knownHosts)
 	return sshtest.WriteFile(t, dir, "config.toml", fmt.Sprintf(`[defaults]
 user           = "root"
 known_hosts    = %q
 identity_files = [%s]
+audit_log      = %q
 
 [hosts.h]
 hostname = %q
 port     = %d
-%s`, kh, strings.Join(quoted, ", "), o.hostname, o.port, settings))
+%s`, kh, strings.Join(quoted, ", "), o.auditLog, o.hostname, o.port, settings))
 }
 
 // trusting is the configuration in which everything should work.
@@ -1016,5 +1023,181 @@ func TestIntegrationCheckJSON(t *testing.T) {
 	}
 	if env.Command != "true" || env.ConnectMS < 0 {
 		t.Errorf("command=%q connect_ms=%d", env.Command, env.ConnectMS)
+	}
+}
+
+// auditRecord is the audit line read back the way an operator's jq would.
+type auditRecord struct {
+	TS          string `json:"ts"`
+	Op          string `json:"op"`
+	Host        string `json:"host"`
+	Target      string `json:"target"`
+	Command     string `json:"command"`
+	Status      string `json:"status"`
+	Kind        string `json:"kind"`
+	ExitCode    int    `json:"exit_code"`
+	DurationMS  int64  `json:"duration_ms"`
+	ConnectMS   int64  `json:"connect_ms"`
+	StdoutBytes int64  `json:"stdout_bytes"`
+	StderrBytes int64  `json:"stderr_bytes"`
+	Truncated   bool   `json:"truncated"`
+	Error       string `json:"error"`
+}
+
+// auditLog reads the log writeConfig placed beside cfg, returning the parsed
+// records and the raw file.
+func auditLog(t *testing.T, cfg string) ([]auditRecord, string) {
+	t.Helper()
+	raw := readFile(t, filepath.Join(filepath.Dir(cfg), "audit.jsonl"))
+	var records []auditRecord
+	for _, line := range strings.Split(strings.TrimSuffix(raw, "\n"), "\n") {
+		var r auditRecord
+		if err := json.Unmarshal([]byte(line), &r); err != nil {
+			t.Fatalf("audit line is not JSON: %v\nline: %q", err, line)
+		}
+		records = append(records, r)
+	}
+	return records, raw
+}
+
+// TestIntegrationAuditRecordsARun is the acceptance case: the fields SPEC §10
+// names, and the output the log must not have seen. The command assembles the
+// secret rather than naming it, because the command string is itself a logged
+// field: finding SECRETOUTPUT in the file can then only mean output was logged.
+func TestIntegrationAuditRecordsARun(t *testing.T) {
+	s := sshtest.Start(t)
+	cfg := trusting(t, s)
+	const command = "s=SECRET; echo ${s}OUTPUT"
+	code, stdout, stderr := errand(t, cfg, "", "run", "h", "--", command)
+	if code != 0 || stdout != "SECRETOUTPUT\n" {
+		t.Fatalf("code=%d stdout=%q stderr=%q", code, stdout, stderr)
+	}
+
+	records, raw := auditLog(t, cfg)
+	if len(records) != 1 {
+		t.Fatalf("log has %d lines after one run, want 1:\n%s", len(records), raw)
+	}
+	got := records[0]
+	want := auditRecord{
+		Op: "run", Host: "h", Target: fmt.Sprintf("root@127.0.0.1:%d", s.Port),
+		Command: command, Status: "ok", ExitCode: 0, StdoutBytes: 13,
+		DurationMS: got.DurationMS, ConnectMS: got.ConnectMS, TS: got.TS,
+	}
+	if got != want {
+		t.Errorf("record = %+v\nwant     %+v", got, want)
+	}
+	if _, err := time.Parse(time.RFC3339, got.TS); err != nil {
+		t.Errorf("ts %q is not RFC 3339: %v", got.TS, err)
+	}
+	if !strings.HasSuffix(got.TS, "Z") {
+		t.Errorf("ts %q is not UTC", got.TS)
+	}
+	if got.DurationMS <= 0 || got.ConnectMS <= 0 {
+		t.Errorf("duration_ms=%d connect_ms=%d, want both timed", got.DurationMS, got.ConnectMS)
+	}
+	if strings.Contains(raw, "SECRETOUTPUT") {
+		t.Errorf("the remote's output reached the log:\n%s", raw)
+	}
+
+	if code, _, stderr := errand(t, cfg, "", "run", "h", "--", "true"); code != 0 {
+		t.Fatalf("second run: code=%d stderr=%q", code, stderr)
+	}
+	records, raw = auditLog(t, cfg)
+	if len(records) != 2 || records[0] != got {
+		t.Errorf("a second run did not append after the first:\n%s", raw)
+	}
+}
+
+// TestIntegrationAuditRecordsEveryOutcome is issue #10's second criterion: a
+// run that ended badly is exactly the one an operator comes to the log for.
+func TestIntegrationAuditRecordsEveryOutcome(t *testing.T) {
+	s := sshtest.Start(t)
+	cases := []struct {
+		name   string
+		trust  bool
+		args   []string
+		status string
+		kind   string
+	}{
+		{"timeout", true, []string{"--timeout", "1s", "--", "sleep 30"}, "timeout", "timeout"},
+		{"truncated", true, []string{"--max-output", "64KiB", "--", "yes"}, "truncated", "truncated"},
+		{"hostkey", false, []string{"--", "true"}, "client_error", "hostkey"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			cfg := writeConfig(t, s, hostConfig{})
+			if c.trust {
+				cfg = trusting(t, s)
+			}
+			code, _, _ := errand(t, cfg, "", append([]string{"run", "h"}, c.args...)...)
+			records, raw := auditLog(t, cfg)
+			if len(records) != 1 {
+				t.Fatalf("log has %d lines, want 1:\n%s", len(records), raw)
+			}
+			got := records[0]
+			if got.Status != c.status || got.Kind != c.kind {
+				t.Errorf("status=%q kind=%q, want %q and %q", got.Status, got.Kind, c.status, c.kind)
+			}
+			if got.ExitCode != code {
+				t.Errorf("logged exit_code %d, want the %d errand exited with", got.ExitCode, code)
+			}
+			if got.Error == "" {
+				t.Errorf("a %s line carries no error message: %s", c.status, raw)
+			}
+			if got.Op != "run" || got.Host != "h" {
+				t.Errorf("op=%q host=%q, want run and h", got.Op, got.Host)
+			}
+		})
+	}
+}
+
+func TestIntegrationAuditRecordsCancellation(t *testing.T) {
+	s := sshtest.Start(t)
+	cfg := trusting(t, s)
+	cmd, _, stderr := startErrand(t, cfg, "run", "h", "--", "echo started; sleep 30")
+	if err := cmd.Process.Signal(syscall.SIGINT); err != nil {
+		t.Fatal(err)
+	}
+	_ = cmd.Wait()
+	t.Logf("exit %d after SIGINT, stderr: %s", cmd.ProcessState.ExitCode(), stderr)
+	records, raw := auditLog(t, cfg)
+	if len(records) != 1 || records[0].Status != "cancelled" || records[0].ExitCode != 130 {
+		t.Errorf("log after SIGINT:\n%s", raw)
+	}
+}
+
+// TestIntegrationAuditUnwritablePathWarns is SPEC §10's "not fatal": the log
+// path leads through a regular file, so no directory can be made for it.
+func TestIntegrationAuditUnwritablePathWarns(t *testing.T) {
+	s := sshtest.Start(t)
+	blocker := sshtest.WriteFile(t, t.TempDir(), "not-a-directory", "")
+	cfg := writeConfig(t, s, hostConfig{
+		knownHosts: s.KnownHostsLine() + "\n",
+		auditLog:   filepath.Join(blocker, "audit.jsonl"),
+	})
+	code, stdout, stderr := errand(t, cfg, "", "run", "h", "--", "echo hi; exit 7")
+	t.Logf("exit %d, stderr: %s", code, stderr)
+	if code != 7 {
+		t.Errorf("code=%d, want the remote's own 7: a log failure is not fatal", code)
+	}
+	if stdout != "hi\n" {
+		t.Errorf("stdout=%q, want the remote's output regardless", stdout)
+	}
+	if !strings.Contains(stderr, "errand: audit:") {
+		t.Errorf("stderr=%q, want an audit warning", stderr)
+	}
+}
+
+// TestIntegrationAuditRecordsCheck covers the other half of "every operation":
+// a preflight reached a host and sent it a command, so it is recorded too.
+func TestIntegrationAuditRecordsCheck(t *testing.T) {
+	s := sshtest.Start(t)
+	cfg := trusting(t, s)
+	if code, _, stderr := errand(t, cfg, "", "check", "h"); code != 0 {
+		t.Fatalf("code=%d stderr=%q", code, stderr)
+	}
+	records, raw := auditLog(t, cfg)
+	if len(records) != 1 || records[0].Op != "check" || records[0].Status != "ok" || records[0].Command != "true" {
+		t.Errorf("check did not record itself:\n%s", raw)
 	}
 }

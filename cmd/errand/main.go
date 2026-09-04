@@ -15,6 +15,7 @@ import (
 	"text/tabwriter"
 	"time"
 
+	"github.com/MatrixMagician/Errand/internal/audit"
 	"github.com/MatrixMagician/Errand/internal/client"
 	"github.com/MatrixMagician/Errand/internal/config"
 	"github.com/MatrixMagician/Errand/internal/envelope"
@@ -162,7 +163,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 	if sub == "check" && res.ExitCode() == 0 {
 		diag("ok %s connect=%dms", res.Target, res.Connect.Milliseconds())
 	}
-	return finish(res, diag, env)
+	return finish(res, diag, env, auditPath(h))
 }
 
 // options are the flag values a subcommand accepts. registerFlags owns which
@@ -260,8 +261,10 @@ func attempt(ctx context.Context, h config.Host, timeout, connect time.Duration,
 }
 
 // finish is the single exit path: every outcome, including the ones that never
-// reached a connection, is reported and scored here.
-func finish(res result.Result, diag client.Diag, env *envelope.Writer) int {
+// reached a connection, is reported and scored here. An empty auditPath is an
+// outcome with no host to record, such as a usage error raised before the
+// alias resolved.
+func finish(res result.Result, diag client.Diag, env *envelope.Writer, auditPath string) int {
 	if d := res.Diagnostic(); d != "" {
 		diag("%s", d)
 	}
@@ -270,7 +273,23 @@ func finish(res result.Result, diag client.Diag, env *envelope.Writer) int {
 			diag("writing the JSON envelope: %v", err)
 		}
 	}
+	if auditPath != "" {
+		// The log is for the operator's forensics, so a full disk warns and
+		// nothing more: it must not change what the caller sees (SPEC §10).
+		if err := audit.Append(auditPath, time.Now(), res); err != nil {
+			diag("audit: %v", err)
+		}
+	}
 	return res.ExitCode()
+}
+
+// auditPath is where this host's operations are recorded: the configured path
+// when [defaults] set one, else the built-in state file.
+func auditPath(h config.Host) string {
+	if h.AuditLog != "" {
+		return h.AuditLog
+	}
+	return config.DefaultAuditLog()
 }
 
 // jsonOutput builds the envelope writer the first time --json is seen. The
@@ -285,7 +304,7 @@ func jsonOutput(have *envelope.Writer, o *options, stdout io.Writer) *envelope.W
 }
 
 func fail(diag client.Diag, env *envelope.Writer, phase result.Phase, host string, err error) int {
-	return finish(result.Result{Host: host, Err: phase.Wrap(host, err)}, diag, env)
+	return finish(result.Result{Host: host, Err: phase.Wrap(host, err)}, diag, env, "")
 }
 
 func failUsage(stderr io.Writer, diag client.Diag, err error) int {
