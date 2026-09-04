@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"os"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -132,5 +133,36 @@ func TestBudgetsCauseIsTimeout(t *testing.T) {
 		if !errors.Is(context.Cause(ctx), result.ErrTimeout) {
 			t.Errorf("cause is %v, want a timeout", context.Cause(ctx))
 		}
+	}
+}
+
+func TestEnvFlag(t *testing.T) {
+	var env envFlag
+	for _, v := range []string{"FOO=bar", "EMPTY=", "WITH=an=equals"} {
+		if err := env.Set(v); err != nil {
+			t.Errorf("Set(%q): %v", v, err)
+		}
+	}
+	if want := []string{"FOO=bar", "EMPTY=", "WITH=an=equals"}; !slices.Equal(env, want) {
+		t.Errorf("env = %q, want %q", env, want)
+	}
+	err := env.Set("NOEQUALS")
+	if err == nil || !strings.Contains(err.Error(), "KEY=VAL") {
+		t.Errorf("Set(\"NOEQUALS\") = %v, want a KEY=VAL complaint", err)
+	}
+	if len(env) != 3 {
+		t.Errorf("a rejected value was still collected: %q", env)
+	}
+}
+
+func TestQuietSilencesOnlyErrandsOwnDiagnostics(t *testing.T) {
+	var loud, quiet bytes.Buffer
+	diagnostics(&loud, false)("saying %s", "something")
+	diagnostics(&quiet, true)("saying %s", "something")
+	if loud.String() != "errand: saying something\n" {
+		t.Errorf("loud = %q", loud.String())
+	}
+	if quiet.Len() != 0 {
+		t.Errorf("quiet = %q, want nothing", quiet.String())
 	}
 }

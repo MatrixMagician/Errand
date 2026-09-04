@@ -660,3 +660,68 @@ func TestIntegrationRunPerHostMaxOutput(t *testing.T) {
 		t.Errorf("flag overriding max_output: code=%d with %d stdout bytes, want 0 and 5000; stderr=%q", code, len(stdout), stderr)
 	}
 }
+
+// TestIntegrationRunEnv is both halves of the AcceptEnv contract. The harness
+// accepts FOO and nothing else, so BAR is the documented silent refusal: the
+// variable never arrives and the command runs anyway.
+func TestIntegrationRunEnv(t *testing.T) {
+	s := sshtest.Start(t)
+	cfg := trusting(t, s)
+	cases := []struct {
+		name    string
+		args    []string
+		command string
+		stdout  string
+	}{
+		{"accepted", []string{"--env", "FOO=bar"}, "echo $FOO", "bar\n"},
+		{"refused", []string{"--env", "BAR=1"}, "echo x$BAR", "x\n"},
+		{"repeated", []string{"--env", "FOO=one", "--env", "FOO=two"}, "echo $FOO", "two\n"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			args := append([]string{"run", "h"}, c.args...)
+			code, stdout, stderr := errand(t, cfg, "", append(args, "--", c.command)...)
+			if code != 0 || stdout != c.stdout {
+				t.Errorf("code=%d stdout=%q, want 0 and %q; stderr=%q", code, stdout, c.stdout, stderr)
+			}
+		})
+	}
+}
+
+func TestIntegrationRunEnvMalformed(t *testing.T) {
+	s := sshtest.Start(t)
+	code, _, stderr := errand(t, trusting(t, s), "", "run", "h", "--env", "NOEQUALS", "--", "true")
+	t.Logf("stderr: %s", stderr)
+	if code != 250 || !strings.Contains(stderr, "KEY=VAL") {
+		t.Errorf("code=%d, want 250 with a KEY=VAL complaint; stderr=%q", code, stderr)
+	}
+}
+
+// TestIntegrationRunPTY pins the flag to something only a PTY can change:
+// tty(1) fails on a plain exec channel and succeeds on a pty-req.
+func TestIntegrationRunPTY(t *testing.T) {
+	s := sshtest.Start(t)
+	cfg := trusting(t, s)
+	code, stdout, stderr := errand(t, cfg, "", "run", "h", "--pty", "--", "tty")
+	t.Logf("with --pty: exit %d stdout=%q stderr=%q", code, stdout, stderr)
+	if code != 0 || !strings.HasPrefix(stdout, "/dev/pts") {
+		t.Errorf("code=%d stdout=%q, want 0 and a /dev/pts device", code, stdout)
+	}
+	if code, stdout, _ = errand(t, cfg, "", "run", "h", "--", "tty"); code != 1 {
+		t.Errorf("without --pty: code=%d stdout=%q, want 1", code, stdout)
+	}
+}
+
+// TestIntegrationRunQuiet is the line SPEC 4.1 draws: --quiet owns errand's
+// own stderr and nothing else on it.
+func TestIntegrationRunQuiet(t *testing.T) {
+	s := sshtest.Start(t)
+	code, _, stderr := errand(t, writeConfig(t, s, hostConfig{}), "", "run", "h", "--quiet", "--", "true")
+	if code != 251 || stderr != "" {
+		t.Errorf("unknown host key: code=%d stderr=%q, want 251 and nothing on stderr", code, stderr)
+	}
+	code, _, stderr = errand(t, trusting(t, s), "", "run", "h", "--quiet", "--", "echo err >&2")
+	if code != 0 || stderr != "err\n" {
+		t.Errorf("remote stderr: code=%d stderr=%q, want 0 and %q", code, stderr, "err\n")
+	}
+}
