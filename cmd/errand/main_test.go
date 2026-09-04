@@ -55,7 +55,12 @@ func TestExit250(t *testing.T) {
 		"run missing host":     {"run"},
 		"run missing command":  {"run", "web-prod"},
 		"unparseable size":     {"run", "web-prod", "--max-output", "1GB", "--", "true"},
-		"get not implemented":  {"get", "web-prod", "a", "b"},
+		"get missing paths":    {"get", "web-prod"},
+		"get missing local":    {"get", "web-prod", "a"},
+		"get extra path":       {"get", "web-prod", "a", "b", "c"},
+		"get takes no mode":    {"get", "web-prod", "--mode", "0644", "a", "b"},
+		"get takes no cap":     {"get", "web-prod", "--max-output", "1KiB", "a", "b"},
+		"get unparseable size": {"get", "web-prod", "--max-size", "1GB", "a", "b"},
 		"put missing paths":    {"put", "web-prod"},
 		"put missing remote":   {"put", "web-prod", "a"},
 		"put extra path":       {"put", "web-prod", "a", "b", "c"},
@@ -182,14 +187,18 @@ func TestQuietSilencesOnlyErrandsOwnDiagnostics(t *testing.T) {
 
 // TestSubcommandsDeclareTheirFlags pins the split registerFlags makes: the four
 // flags that bound a connection belong to every subcommand that opens one, and
-// the ones that shape a command or a transfer belong to just the one.
+// each of the rest belongs to exactly the subcommands listed against it.
 func TestSubcommandsDeclareTheirFlags(t *testing.T) {
 	shared := []string{"timeout", "connect-timeout", "quiet", "json"}
-	only := map[string][]string{
-		"run": {"stdin", "pty", "env", "max-output"},
-		"put": {"mode", "max-size"},
+	owners := map[string][]string{
+		"stdin":      {"run"},
+		"pty":        {"run"},
+		"env":        {"run"},
+		"max-output": {"run"},
+		"mode":       {"put"},
+		"max-size":   {"put", "get"},
 	}
-	for _, sub := range []string{"run", "put", "check"} {
+	for _, sub := range []string{"run", "put", "get", "check"} {
 		fs := flag.NewFlagSet(sub, flag.ContinueOnError)
 		registerFlags(fs, sub)
 		for _, name := range shared {
@@ -197,11 +206,9 @@ func TestSubcommandsDeclareTheirFlags(t *testing.T) {
 				t.Errorf("%s does not declare --%s", sub, name)
 			}
 		}
-		for owner, names := range only {
-			for _, name := range names {
-				if got, want := fs.Lookup(name) != nil, sub == owner; got != want {
-					t.Errorf("%s declares --%s: %v, want %v", sub, name, got, want)
-				}
+		for name, subs := range owners {
+			if got, want := fs.Lookup(name) != nil, slices.Contains(subs, sub); got != want {
+				t.Errorf("%s declares --%s: %v, want %v", sub, name, got, want)
 			}
 		}
 	}
@@ -291,10 +298,12 @@ func TestPutModeIsParsedAsOctal(t *testing.T) {
 	}
 }
 
-func TestPutMaxSizeDefaultsTo64MiB(t *testing.T) {
-	fs := flag.NewFlagSet("put", flag.ContinueOnError)
-	o := registerFlags(fs, "put")
-	if err := fs.Parse(nil); err != nil || o.maxSize != 64<<20 {
-		t.Errorf("maxSize=%d err=%v, want %d", o.maxSize, err, 64<<20)
+func TestMaxSizeDefaultsTo64MiB(t *testing.T) {
+	for _, sub := range []string{"put", "get"} {
+		fs := flag.NewFlagSet(sub, flag.ContinueOnError)
+		o := registerFlags(fs, sub)
+		if err := fs.Parse(nil); err != nil || o.maxSize != 64<<20 {
+			t.Errorf("%s: maxSize=%d err=%v, want %d", sub, o.maxSize, err, 64<<20)
+		}
 	}
 }
