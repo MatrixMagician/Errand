@@ -28,18 +28,20 @@ const usage = `usage:
   errand run   <host> [flags] -- <command...>   execute a command
   errand put   <host> [flags] <local> <remote>  upload a file (SFTP)
   errand get   <host> [flags] <remote> <local>  download a file (SFTP)
-  errand check <host> [flags]                   preflight: resolve, connect, authenticate
+  errand check <host> [flags]                   preflight: connect, authenticate, run 'true'
   errand hosts                                  list declared hosts and resolved parameters
   errand version                                print the version
 
-flags for run:
-  --stdin                                       stream local stdin to the remote command
+flags for run and check:
   --timeout <dur>                               wall-clock limit for the whole invocation
   --connect-timeout <dur>                       limit for TCP, handshake and auth, within --timeout
+  --quiet                                       suppress errand's own diagnostics, never the remote's
+
+flags for run only:
+  --stdin                                       stream local stdin to the remote command
   --max-output <bytes>                          combined cap across stdout and stderr; 0 disables
   --env KEY=VAL                                 set a remote environment variable; repeatable
   --pty                                         request a PTY for tools that refuse to run without one
-  --quiet                                       suppress errand's own diagnostics, never the remote's
 
 <host> is an alias declared in the config file (default ~/.config/errand/config.toml,
 overridable with ERRAND_CONFIG). Exit 250 on usage or configuration errors.
@@ -72,23 +74,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("errand "+sub, flag.ContinueOnError)
 	fs.SetOutput(io.Discard) // we print errors ourselves with the errand: prefix
 	fs.Usage = func() {}     // printed by us: on -h below, never on a parse error
-	var stdin, pty, quiet bool
-	var env envFlag
-	var timeout, connectTimeout time.Duration
-	var maxOutput int64
-	if sub == "run" {
-		fs.BoolVar(&stdin, "stdin", false, "stream local stdin to the remote command")
-		fs.BoolVar(&pty, "pty", false, "request a PTY")
-		fs.BoolVar(&quiet, "quiet", false, "suppress errand's own diagnostics")
-		fs.Var(&env, "env", "KEY=VAL to set on the remote command; repeatable")
-		fs.DurationVar(&timeout, "timeout", 0, "wall-clock limit for the whole invocation")
-		fs.DurationVar(&connectTimeout, "connect-timeout", defaultConnectTimeout, "limit for TCP, handshake and auth")
-		fs.Func("max-output", "combined cap across stdout and stderr; 0 disables", func(v string) error {
-			var err error
-			maxOutput, err = config.ParseSize(v)
-			return err
-		})
-	}
+	o := registerFlags(fs, sub)
 	if err := fs.Parse(rest); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			fmt.Fprint(stdout, usage)
@@ -115,39 +101,85 @@ func run(args []string, stdout, stderr io.Writer) int {
 	}
 	// Only now is --quiet known. Everything above it is a usage error, which
 	// is the one diagnostic an operator needs whether they asked for it or not.
-	diag = diagnostics(stderr, quiet)
+	diag = diagnostics(stderr, o.quiet)
 	h, err := cfg.Resolve(alias)
 	if err != nil {
 		return fail(diag, result.Resolve, alias, err)
 	}
-	if sub != "run" {
+	if sub != "run" && sub != "check" {
 		return fail(diag, result.Usage, "", fmt.Errorf("%s: not implemented", sub))
 	}
 
-	command := strings.Join(fs.Args(), " ")
-	if command == "" {
-		return fail(diag, result.Usage, "", errors.New("run: missing <command>"))
-	}
-	var in io.Reader
-	if stdin {
-		in = os.Stdin
+	var req exec.Request
+	if sub == "run" {
+		command := strings.Join(fs.Args(), " ")
+		if command == "" {
+			return fail(diag, result.Usage, "", errors.New("run: missing <command>"))
+		}
+		if !given(fs, "max-output") {
+			o.maxOutput = int64(h.MaxOutput)
+		}
+		var in io.Reader
+		if o.stdin {
+			in = os.Stdin
+		}
+		req = exec.Request{
+			Command: command, Stdin: in, Stdout: stdout, Stderr: stderr,
+			MaxOutput: o.maxOutput, Env: o.env, PTY: o.pty,
+		}
+	} else {
+		if fs.NArg() > 0 {
+			return fail(diag, result.Usage, "", fmt.Errorf("check: takes no command, got %q", fs.Arg(0)))
+		}
+		// check is run with the question narrowed to the connection: a command
+		// every host has, and both streams discarded, so the only thing the
+		// caller learns is whether errand could get there and back.
+		req = exec.Request{Command: "true", Stdout: io.Discard, Stderr: io.Discard}
 	}
 	if !given(fs, "timeout") {
-		timeout = h.Timeout
-	}
-	if !given(fs, "max-output") {
-		maxOutput = int64(h.MaxOutput)
+		o.timeout = h.Timeout
 	}
 	ctx, stop := interruptible(context.Background())
 	defer stop()
-	res := attempt(ctx, h, timeout, connectTimeout, diag, func(ctx context.Context, c *client.Conn) result.Result {
-		return exec.Run(ctx, c, exec.Request{
-			Command: command, Stdin: in, Stdout: stdout, Stderr: stderr,
-			MaxOutput: maxOutput, Env: env, PTY: pty,
-		})
+	res := attempt(ctx, h, o.timeout, o.connectTimeout, diag, func(ctx context.Context, c *client.Conn) result.Result {
+		return exec.Run(ctx, c, req)
 	})
-	res.Op = "run"
+	res.Op = sub
+	if sub == "check" && res.ExitCode() == 0 {
+		diag("ok %s connect=%dms", res.Target, res.Connect.Milliseconds())
+	}
 	return finish(res, diag)
+}
+
+// options are the flag values a subcommand accepts. registerFlags owns which
+// subcommand declares which, so the flags run and check share are described in
+// exactly one place.
+type options struct {
+	stdin, pty, quiet       bool
+	env                     envFlag
+	timeout, connectTimeout time.Duration
+	maxOutput               int64
+}
+
+func registerFlags(fs *flag.FlagSet, sub string) *options {
+	var o options
+	if sub != "run" && sub != "check" {
+		return &o
+	}
+	fs.BoolVar(&o.quiet, "quiet", false, "suppress errand's own diagnostics")
+	fs.DurationVar(&o.timeout, "timeout", 0, "wall-clock limit for the whole invocation")
+	fs.DurationVar(&o.connectTimeout, "connect-timeout", defaultConnectTimeout, "limit for TCP, handshake and auth")
+	if sub == "run" {
+		fs.BoolVar(&o.stdin, "stdin", false, "stream local stdin to the remote command")
+		fs.BoolVar(&o.pty, "pty", false, "request a PTY")
+		fs.Var(&o.env, "env", "KEY=VAL to set on the remote command; repeatable")
+		fs.Func("max-output", "combined cap across stdout and stderr; 0 disables", func(v string) error {
+			var err error
+			o.maxOutput, err = config.ParseSize(v)
+			return err
+		})
+	}
+	return &o
 }
 
 // defaultConnectTimeout bounds TCP, handshake and auth (SPEC 4.1). Unlike

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"flag"
 	"os"
 	"slices"
 	"strings"
@@ -45,16 +46,20 @@ func TestHostsMatchesGolden(t *testing.T) {
 func TestExit250(t *testing.T) {
 	t.Setenv("ERRAND_CONFIG", "testdata/fixture.toml")
 	cases := map[string][]string{
-		"no args":               nil,
-		"unknown subcommand":    {"frobnicate"},
-		"bad flag":              {"hosts", "--nope"},
-		"bad flag on run":       {"run", "--nope", "web-prod", "--", "true"},
-		"run missing host":      {"run"},
-		"run missing command":   {"run", "web-prod"},
-		"unparseable size":      {"run", "web-prod", "--max-output", "1GB", "--", "true"},
-		"put not implemented":   {"put", "web-prod", "a", "b"},
-		"get not implemented":   {"get", "web-prod", "a", "b"},
-		"check not implemented": {"check", "web-prod"},
+		"no args":              nil,
+		"unknown subcommand":   {"frobnicate"},
+		"bad flag":             {"hosts", "--nope"},
+		"bad flag on run":      {"run", "--nope", "web-prod", "--", "true"},
+		"run missing host":     {"run"},
+		"run missing command":  {"run", "web-prod"},
+		"unparseable size":     {"run", "web-prod", "--max-output", "1GB", "--", "true"},
+		"put not implemented":  {"put", "web-prod", "a", "b"},
+		"get not implemented":  {"get", "web-prod", "a", "b"},
+		"check takes no stdin": {"check", "web-prod", "--stdin"},
+		"check takes no env":   {"check", "web-prod", "--env", "A=b"},
+		"check takes no pty":   {"check", "web-prod", "--pty"},
+		"check takes no cap":   {"check", "web-prod", "--max-output", "1KiB"},
+		"check takes no args":  {"check", "web-prod", "uptime"},
 	}
 	for name, args := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -164,5 +169,27 @@ func TestQuietSilencesOnlyErrandsOwnDiagnostics(t *testing.T) {
 	}
 	if quiet.Len() != 0 {
 		t.Errorf("quiet = %q, want nothing", quiet.String())
+	}
+}
+
+// TestCheckDeclaresTheSharedFlags pins the split registerFlags makes: the three
+// flags that bound a connection are check's too, the ones that shape a command
+// are not.
+func TestCheckDeclaresTheSharedFlags(t *testing.T) {
+	shared := []string{"timeout", "connect-timeout", "quiet"}
+	runOnly := []string{"stdin", "pty", "env", "max-output"}
+	for _, sub := range []string{"run", "check"} {
+		fs := flag.NewFlagSet(sub, flag.ContinueOnError)
+		registerFlags(fs, sub)
+		for _, name := range shared {
+			if fs.Lookup(name) == nil {
+				t.Errorf("%s does not declare --%s", sub, name)
+			}
+		}
+		for _, name := range runOnly {
+			if got, want := fs.Lookup(name) != nil, sub == "run"; got != want {
+				t.Errorf("%s declares --%s: %v, want %v", sub, name, got, want)
+			}
+		}
 	}
 }
