@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -62,6 +63,21 @@ func Run(ctx context.Context, c *client.Conn, req Request) result.Result {
 			_, _ = io.Copy(w, req.Stdin)
 			_ = w.Close()
 		}()
+	}
+
+	if req.PTY {
+		if err := sess.RequestPty("xterm", 24, 80, ssh.TerminalModes{ssh.ECHO: 0}); err != nil {
+			r.Err = result.Exec.Wrap(alias, err)
+			return r
+		}
+	}
+
+	// A rejected variable is the server's AcceptEnv policy talking, not a
+	// failure of ours, and OpenSSH declines silently often enough that the
+	// error is not worth acting on either way. SPEC 4.1 documents the policy.
+	for _, kv := range req.Env {
+		k, v, _ := strings.Cut(kv, "=")
+		_ = sess.Setenv(k, v)
 	}
 
 	if err := sess.Start(req.Command); err != nil {
