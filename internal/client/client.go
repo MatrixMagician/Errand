@@ -36,8 +36,18 @@ type Conn struct {
 }
 
 // Dial connects, verifies the host key and authenticates. Every error is
-// wrapped with the host alias and the phase it failed in.
+// wrapped with the host alias and the phase it failed in, unless ctx ran out
+// first: then the outcome is the timeout or the interrupt, not the symptom the
+// aborted handshake reported.
 func Dial(ctx context.Context, h config.Host, diag Diag) (*Conn, error) {
+	c, err := dial(ctx, h, diag)
+	if err != nil && ctx.Err() != nil {
+		return nil, result.StopCause(ctx)
+	}
+	return c, err
+}
+
+func dial(ctx context.Context, h config.Host, diag Diag) (*Conn, error) {
 	if diag == nil {
 		diag = func(string, ...any) {}
 	}
