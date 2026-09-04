@@ -1,0 +1,23 @@
+{
+  "permissions": {
+    "deny": [
+      "Bash(ssh *)",
+      "Bash(scp *)",
+      "Bash(sftp *)",
+      "Bash(rsync *)"
+    ]
+  },
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$HOME/.claude/hooks/errand-allow-hook.py\""
+          }
+        ]
+      }
+    ]
+  }
+}
