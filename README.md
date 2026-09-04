@@ -56,11 +56,14 @@ errand run   <host> [flags] -- <command...>
 errand put   <host> [flags] <local> <remote>
 errand get   <host> [flags] <remote> <local>
 errand check <host> [flags]
+errand allow <subcommand> [args...]
 errand hosts
 errand version
 ```
 
 `<host>` is always an alias from the config file, never `user@hostname`. Flags go before or after the alias, but before the command or the paths. `errand --help` and `errand <subcommand> --help` print the same usage text as this section.
+
+`errand allow` takes the tail of any `errand` invocation and answers whether a harness may run it without asking a human: exit 0 and nothing on stdout when the command is on the host's `allow_commands` list, exit 1 and a one-line reason on stdout when it is not, exit 250 for the usage and configuration errors the judged subcommand would raise. `hosts`, `version`, `check`, and `get` always pass; `put` never does; `run` is judged by the first word of its command. `run`, `put`, and `get` never consult the list themselves (ADR-0003).
 
 ### Write `--` before the command
 
@@ -172,6 +175,7 @@ host_key = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI..."
 | `user` | string | the local `$USER` | Login name for hosts that do not set their own. |
 | `timeout` | duration | `120s` | `--timeout` for hosts that do not set their own. |
 | `max_output` | size | `1MiB` | `--max-output` for hosts that do not set their own. |
+| `allow_commands` | list of strings | none | Commands an agent may run Unattended, for hosts that do not set their own list. |
 | `known_hosts` | string or list of strings | none | Files to verify host keys against, in OpenSSH format. Files that do not exist are skipped. With no readable file, every host key is unknown. |
 | `identity_files` | string or list of strings | none | Private key files to try after the SSH agent, in order. |
 | `audit_log` | string | `$XDG_STATE_HOME/errand/audit.jsonl`, else `~/.local/state/errand/audit.jsonl` | Where operations are recorded. |
@@ -185,6 +189,7 @@ host_key = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI..."
 | `user` | string | `[defaults] user` | Login name. |
 | `timeout` | duration | `[defaults] timeout` | `--timeout` for this host. |
 | `max_output` | size | `[defaults] max_output` | `--max-output` for this host. |
+| `allow_commands` | list of strings | `[defaults] allow_commands` | Replaces the default list for this host. `[]` allows nothing. |
 | `accept_new` | bool | `false` | Record an unknown host key on first contact and proceed. See [Host keys](#host-keys). |
 | `host_key` | string | none | Pinned public key in `authorized_keys` format. When set, `known_hosts` is not consulted for this host. |
 | `via` | string | none | Reserved for bastion hops. Setting it is a configuration error in this version. |

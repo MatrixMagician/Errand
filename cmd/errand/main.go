@@ -33,6 +33,7 @@ const usage = `usage:
   errand put   <host> [flags] <local> <remote>  upload a file (SFTP)
   errand get   <host> [flags] <remote> <local>  download a file (SFTP)
   errand check <host> [flags]                   preflight: connect, authenticate, run 'true'
+  errand allow <subcommand> [args...]           would the invocation be unattended? exit 0 yes, 1 no with the reason on stdout
   errand hosts                                  list declared hosts and resolved parameters
   errand version                                print the version
 
