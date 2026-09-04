@@ -9,6 +9,7 @@ import (
 	"io/fs"
 	"os"
 	"path"
+	"path/filepath"
 	"strconv"
 	"time"
 
@@ -61,12 +62,71 @@ func Put(ctx context.Context, c *client.Conn, local, remote string, mode fs.File
 	defer func() { _ = sc.Close() }()
 
 	tmp := tempName(remote)
-	// Put must not return before the handler has had its window, or the
-	// caller's Conn.Close would take the connection away mid-cleanup.
+	return move(ctx, c, r.Command,
+		func() (int64, error) { return upload(sc, src, tmp, remote, mode) },
+		func() { _ = sc.Remove(tmp) })
+}
+
+// Get downloads remote to local, the same guarantee in the other direction: the
+// bytes go to a temporary name in the local destination directory and are
+// renamed into place, so a partial download never appears under the final name.
+func Get(ctx context.Context, c *client.Conn, remote, local string, maxSize int64) result.Result {
+	alias := c.Host.Alias
+	r := result.Result{Host: alias, Command: remote + " " + local}
+
+	if fi, err := os.Stat(local); err == nil && fi.IsDir() {
+		r.Err = result.Usage.Wrap(alias, fmt.Errorf("%s is a directory, and get names the file to write", local))
+		return r
+	}
+	if _, err := os.Stat(filepath.Dir(local)); err != nil {
+		r.Err = result.Usage.Wrap(alias, err)
+		return r
+	}
+
+	sc, err := sftp.NewClient(c.Client)
+	if err != nil {
+		r.Err = result.Transfer.Wrap(alias, err)
+		return r
+	}
+	defer func() { _ = sc.Close() }()
+
+	fi, err := sc.Stat(remote)
+	if err != nil {
+		r.Err = result.Transfer.Wrap(alias, err)
+		return r
+	}
+	if fi.IsDir() {
+		r.Err = result.Transfer.Wrap(alias, fmt.Errorf("%s is a directory, and get moves one file", remote))
+		return r
+	}
+	if maxSize > 0 && fi.Size() > maxSize {
+		r.Err = result.Usage.Wrap(alias, fmt.Errorf("%s is %d bytes, over --max-size %d", remote, fi.Size(), maxSize))
+		return r
+	}
+	src, err := sc.Open(remote)
+	if err != nil {
+		r.Err = result.Transfer.Wrap(alias, err)
+		return r
+	}
+	defer func() { _ = src.Close() }()
+
+	tmp := localTempName(local)
+	return move(ctx, c, r.Command,
+		func() (int64, error) { return download(src, tmp, local) },
+		func() { _ = os.Remove(tmp) })
+}
+
+// move runs the copy a transfer is and scores it. body writes to a temporary
+// name and renames into place; discard unlinks that temporary on whichever side
+// holds it. Cancellation gets discard in while the connection is still up, then
+// takes the socket away, and move does not return until that window has closed:
+// returning earlier would let the caller's Conn.Close cut cleanup short.
+func move(ctx context.Context, c *client.Conn, command string, body func() (int64, error), discard func()) result.Result {
+	r := result.Result{Host: c.Host.Alias, Command: command}
 	cleaned := make(chan struct{})
 	stop := context.AfterFunc(ctx, func() {
 		defer close(cleaned)
-		abandon(c, sc, tmp)
+		abandon(c, discard)
 	})
 	defer func() {
 		if !stop() {
@@ -74,14 +134,14 @@ func Put(ctx context.Context, c *client.Conn, local, remote string, mode fs.File
 		}
 	}()
 
-	n, err := upload(sc, src, tmp, remote, mode)
+	n, err := body()
 	r.StdoutBytes = n
 	switch {
 	case ctx.Err() != nil:
 		r.Err = result.StopCause(ctx)
 	case err != nil:
-		_ = sc.Remove(tmp)
-		r.Err = result.Transfer.Wrap(alias, err)
+		discard()
+		r.Err = result.Transfer.Wrap(c.Host.Alias, err)
 	default:
 		r.Remote = &result.Remote{}
 	}
@@ -93,6 +153,12 @@ func Put(ctx context.Context, c *client.Conn, local, remote string, mode fs.File
 // the pid keeps two concurrent errands off each other's file.
 func tempName(remote string) string {
 	return path.Join(path.Dir(remote), "."+path.Base(remote)+".errand-"+strconv.Itoa(os.Getpid()))
+}
+
+// localTempName is the same name on this side of the connection, where the
+// separator is the local one rather than SFTP's slash.
+func localTempName(local string) string {
+	return filepath.Join(filepath.Dir(local), "."+filepath.Base(local)+".errand-"+strconv.Itoa(os.Getpid()))
 }
 
 func upload(sc *sftp.Client, src io.Reader, tmp, remote string, mode fs.FileMode) (int64, error) {
@@ -113,6 +179,24 @@ func upload(sc *sftp.Client, src io.Reader, tmp, remote string, mode fs.FileMode
 	return n, rename(sc, tmp, remote)
 }
 
+// download writes 0644 before umask, the mode a shell redirect would give the
+// file: the remote bits are the sender's, and carrying them across would let a
+// remote 0777 decide what this machine ends up with.
+func download(src io.Reader, tmp, local string) (int64, error) {
+	w, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
+	if err != nil {
+		return 0, err
+	}
+	n, err := io.Copy(w, src)
+	if cerr := w.Close(); err == nil {
+		err = cerr
+	}
+	if err != nil {
+		return n, err
+	}
+	return n, os.Rename(tmp, local)
+}
+
 // rename puts the finished bytes under their final name. posix-rename replaces
 // an existing destination in one step; without the extension the destination
 // has to go first, which is the one moment a reader can see neither file.
@@ -126,14 +210,14 @@ func rename(sc *sftp.Client, tmp, remote string) error {
 
 // abandon unlinks the temp file while the connection is still up, then takes
 // the socket away whatever the server is doing. Unlinking a file the copy still
-// holds open is what leaves the remote with neither name; on a connection
-// already stalled hard enough that the request cannot go out, the window
+// holds open is what leaves the destination with neither name; on a connection
+// already stalled hard enough that a remote unlink cannot go out, the window
 // expires and the temp file survives. The final name never appears either way.
-func abandon(c *client.Conn, sc *sftp.Client, tmp string) {
+func abandon(c *client.Conn, discard func()) {
 	removed := make(chan struct{})
 	go func() {
 		defer close(removed)
-		_ = sc.Remove(tmp)
+		discard()
 	}()
 	select {
 	case <-removed:

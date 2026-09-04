@@ -36,7 +36,7 @@ const usage = `usage:
   errand hosts                                  list declared hosts and resolved parameters
   errand version                                print the version
 
-flags for run, put and check:
+flags for run, put, get and check:
   --timeout <dur>                               wall-clock limit for the whole invocation
   --connect-timeout <dur>                       limit for TCP, handshake and auth, within --timeout
   --quiet                                       suppress errand's own diagnostics, never the remote's
@@ -48,9 +48,11 @@ flags for run only:
   --env KEY=VAL                                 set a remote environment variable; repeatable
   --pty                                         request a PTY for tools that refuse to run without one
 
+flags for put and get:
+  --max-size <bytes>                            reject a larger source file before transferring; default 64MiB
+
 flags for put only:
   --mode <octal>                                permission bits for the remote file; default 0644
-  --max-size <bytes>                            reject a larger local file before sending; default 64MiB
 
 <host> is an alias declared in the config file (default ~/.config/errand/config.toml,
 overridable with ERRAND_CONFIG). Exit 250 on usage or configuration errors.
@@ -163,6 +165,14 @@ func run(args []string, stdout, stderr io.Writer) int {
 		body = func(ctx context.Context, c *client.Conn) result.Result {
 			return transfer.Put(ctx, c, local, remote, o.mode, o.maxSize)
 		}
+	case "get":
+		if fs.NArg() != 2 {
+			return fail(diag, env, result.Usage, "", fmt.Errorf("get: want <remote> <local>, got %d arguments", fs.NArg()))
+		}
+		remote, local := fs.Arg(0), fs.Arg(1)
+		body = func(ctx context.Context, c *client.Conn) result.Result {
+			return transfer.Get(ctx, c, remote, local, o.maxSize)
+		}
 	default:
 		return fail(diag, env, result.Usage, "", fmt.Errorf("%s: not implemented", sub))
 	}
@@ -180,8 +190,8 @@ func run(args []string, stdout, stderr io.Writer) int {
 }
 
 // options are the flag values a subcommand accepts. registerFlags owns which
-// subcommand declares which, so the flags run, put and check share are described in
-// exactly one place.
+// subcommand declares which, so the flags run, put, get and check share are
+// described in exactly one place.
 type options struct {
 	stdin, pty, quiet, json bool
 	env                     envFlag
@@ -193,7 +203,7 @@ type options struct {
 func registerFlags(fs *flag.FlagSet, sub string) *options {
 	o := options{mode: defaultMode, maxSize: int64(defaultMaxSize)}
 	switch sub {
-	case "run", "put", "check":
+	case "run", "put", "get", "check":
 	default:
 		return &o
 	}
@@ -211,7 +221,14 @@ func registerFlags(fs *flag.FlagSet, sub string) *options {
 			o.maxOutput, err = config.ParseSize(v)
 			return err
 		})
-	case "put":
+	case "put", "get":
+		fs.Func("max-size", "reject a larger source file before transferring", func(v string) error {
+			var err error
+			o.maxSize, err = config.ParseSize(v)
+			return err
+		})
+	}
+	if sub == "put" {
 		fs.Func("mode", "octal permission bits for the remote file", func(v string) error {
 			bits, err := strconv.ParseUint(v, 8, 32)
 			if err != nil {
@@ -219,11 +236,6 @@ func registerFlags(fs *flag.FlagSet, sub string) *options {
 			}
 			o.mode = os.FileMode(bits)
 			return nil
-		})
-		fs.Func("max-size", "reject a larger local file before sending", func(v string) error {
-			var err error
-			o.maxSize, err = config.ParseSize(v)
-			return err
 		})
 	}
 	return &o

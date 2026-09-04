@@ -1488,3 +1488,197 @@ func sparsePayload(t *testing.T, n int64) string {
 	}
 	return path
 }
+
+// entries names what a download's destination directory holds: an interrupted
+// get is judged on what the operator is left holding.
+func entries(t *testing.T, dir string) []string {
+	t.Helper()
+	des, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	names := make([]string, len(des))
+	for i, de := range des {
+		names[i] = de.Name()
+	}
+	return names
+}
+
+func sha256File(t *testing.T, path string) string {
+	t.Helper()
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := sha256.Sum256(b)
+	return hex.EncodeToString(h[:])
+}
+
+// TestIntegrationGetRoundTrip is the acceptance case: the file that went up
+// comes back byte for byte, the destination directory holds nothing but it, and
+// the audit line carries op get and the transfer paths.
+func TestIntegrationGetRoundTrip(t *testing.T) {
+	s := sshtest.Start(t)
+	cfg := trusting(t, s)
+	dir := remoteDir(t, cfg)
+	src := dir + "/file"
+
+	const size = 1 << 20
+	local, sum := payload(t, size)
+	if code, _, stderr := errand(t, cfg, "", "put", "h", local, src); code != 0 {
+		t.Fatalf("put: code=%d stderr=%q", code, stderr)
+	}
+
+	down := t.TempDir()
+	dst := filepath.Join(down, "file")
+	code, stdout, stderr := errand(t, cfg, "", "get", "h", src, dst)
+	if code != 0 || stdout != "" {
+		t.Fatalf("code=%d stdout=%q stderr=%q", code, stdout, stderr)
+	}
+	if got := sha256File(t, dst); got != sum {
+		t.Errorf("local sha256 = %q, want %s", got, sum)
+	}
+	if got := entries(t, down); !slices.Equal(got, []string{"file"}) {
+		t.Errorf("destination directory holds %q, want just the destination", got)
+	}
+	if fi, err := os.Stat(dst); err != nil {
+		t.Error(err)
+	} else if fi.Mode().Perm()&^0o022 != 0o644&^0o022 {
+		t.Errorf("local mode = %04o, want 0644 before umask", fi.Mode().Perm())
+	}
+
+	// A second get over the same name replaces it rather than failing.
+	second, sum2 := payload(t, 4096)
+	if code, _, stderr := errand(t, cfg, "", "put", "h", second, src); code != 0 {
+		t.Fatalf("second put: code=%d stderr=%q", code, stderr)
+	}
+	if code, _, stderr := errand(t, cfg, "", "get", "h", src, dst); code != 0 {
+		t.Fatalf("second get: code=%d stderr=%q", code, stderr)
+	}
+	if got := sha256File(t, dst); got != sum2 {
+		t.Errorf("after replacing, local sha256 = %q, want %s", got, sum2)
+	}
+
+	records, raw := auditLog(t, cfg)
+	i := slices.IndexFunc(records, func(r auditRecord) bool { return r.Op == "get" })
+	if i < 0 {
+		t.Fatalf("no get in the audit log:\n%s", raw)
+	}
+	rec := records[i]
+	switch {
+	case rec.Command != src+" "+dst:
+		t.Errorf("audit command = %q, want the transfer paths", rec.Command)
+	case rec.Status != "ok" || rec.ExitCode != 0:
+		t.Errorf("audit status=%q exit_code=%d", rec.Status, rec.ExitCode)
+	case rec.StdoutBytes != size:
+		t.Errorf("audit stdout_bytes = %d, want %d", rec.StdoutBytes, size)
+	}
+	if t.Failed() {
+		t.Logf("audit log:\n%s", raw)
+	}
+}
+
+// TestIntegrationGetOverMaxSize checks the remote stat decides before any bytes
+// move: neither the temporary nor the final name is ever created.
+func TestIntegrationGetOverMaxSize(t *testing.T) {
+	s := sshtest.Start(t)
+	cfg := trusting(t, s)
+	dir := remoteDir(t, cfg)
+	src := dir + "/file"
+	local, _ := payload(t, 1<<20)
+	if code, _, stderr := errand(t, cfg, "", "put", "h", local, src); code != 0 {
+		t.Fatalf("put: code=%d stderr=%q", code, stderr)
+	}
+
+	down := t.TempDir()
+	code, _, stderr := errand(t, cfg, "", "get", "h", "--max-size", "512KiB", src, filepath.Join(down, "file"))
+	if code != 250 {
+		t.Fatalf("code=%d, want 250; stderr=%q", code, stderr)
+	}
+	if !strings.Contains(stderr, "--max-size") || !strings.Contains(stderr, "1048576") {
+		t.Errorf("stderr=%q, want the size and the flag that rejected it", stderr)
+	}
+	if got := entries(t, down); len(got) != 0 {
+		t.Errorf("destination directory holds %q, want nothing", got)
+	}
+}
+
+func TestIntegrationGetFailures(t *testing.T) {
+	s := sshtest.Start(t)
+	cfg := trusting(t, s)
+	dir := remoteDir(t, cfg)
+	src := dir + "/file"
+	local, _ := payload(t, 64)
+	if code, _, stderr := errand(t, cfg, "", "put", "h", local, src); code != 0 {
+		t.Fatalf("put: code=%d stderr=%q", code, stderr)
+	}
+	down := t.TempDir()
+	for _, tc := range []struct {
+		name, remote, local string
+		code                int
+		want                string
+	}{
+		{"missing remote file", dir + "/absent", filepath.Join(down, "file"), 253, "transfer"},
+		{"remote is a directory", dir, filepath.Join(down, "file"), 253, "transfer"},
+		{"missing local directory", src, filepath.Join(down, "absent", "file"), 250, "usage"},
+		{"local is a directory", src, down, 250, "usage"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			code, _, stderr := errand(t, cfg, "", "get", "h", tc.remote, tc.local)
+			if code != tc.code {
+				t.Fatalf("code=%d, want %d; stderr=%q", code, tc.code, stderr)
+			}
+			if !strings.Contains(stderr, "errand: h: "+tc.want+": ") {
+				t.Errorf("stderr=%q, want a %s phase", stderr, tc.want)
+			}
+		})
+	}
+	if got := entries(t, down); len(got) != 0 {
+		t.Errorf("destination directory holds %q, want nothing", got)
+	}
+}
+
+// TestIntegrationGetInterrupted is the local half of the guarantee put makes
+// remotely: a download cut mid-flight leaves nothing under the final name. The
+// temporary is unlinked in the same window, which locally it always is, and the
+// test records what the directory actually holds either way.
+func TestIntegrationGetInterrupted(t *testing.T) {
+	s := sshtest.Start(t)
+	cfg := trusting(t, s)
+	dir := remoteDir(t, cfg)
+	src := dir + "/big"
+	remote(t, cfg, fmt.Sprintf("truncate -s %d %s", interruptSize, src))
+
+	down := t.TempDir()
+	dst := filepath.Join(down, "file")
+	start := time.Now()
+	code, stdout, stderr := errand(t, cfg, "", "get", "h", "--json",
+		"--max-size", "600MiB", "--timeout", interruptAfter.String(), src, dst)
+	took := time.Since(start)
+	_, env := splitEnvelope(t, stdout)
+	t.Logf("cut after %d of %d bytes (%.0f%%) in %v", env.StdoutBytes, interruptSize,
+		100*float64(env.StdoutBytes)/interruptSize, took)
+	if code != 254 || env.Status != "timeout" {
+		t.Fatalf("code=%d status=%q, want 254 and timeout (a %d-byte get should not finish in %v); stderr=%q",
+			code, env.Status, interruptSize, interruptAfter, stderr)
+	}
+	if !strings.Contains(stderr, "timeout") {
+		t.Errorf("stderr=%q, want a timeout diagnostic", stderr)
+	}
+	// Without this the test would still pass if the cut landed during the
+	// handshake, having proved nothing about a transfer in flight.
+	if env.StdoutBytes <= 0 || env.StdoutBytes >= interruptSize {
+		t.Fatalf("cut after %d bytes, want a cut partway through %d", env.StdoutBytes, interruptSize)
+	}
+	if took > interruptAfter+5*time.Second {
+		t.Errorf("took %v, want the budget plus a bounded teardown", took)
+	}
+	left := entries(t, down)
+	t.Logf("after the cut, the destination directory holds %q", left)
+	if slices.Contains(left, "file") {
+		t.Errorf("the final name survives a cut transfer: %q", left)
+	}
+	if len(left) != 0 {
+		t.Errorf("the temp file survives a cut transfer: %q", left)
+	}
+}
