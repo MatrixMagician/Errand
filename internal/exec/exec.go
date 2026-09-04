@@ -102,18 +102,22 @@ func teardown(c *client.Conn, sess *ssh.Session, waitC <-chan error, onCap bool)
 	default:
 	}
 
+	// Only a cap breach lets the remote's own code win (SPEC 5.4), so only it
+	// pays for the wait, and it has to be paid before the kill below rather
+	// than alongside it: a remote whose last bytes overshot the cap is
+	// milliseconds from exiting, and a KILL raced against it wins often
+	// enough to make the exit code a coin toss. The capping writers keep
+	// swallowing output throughout, so the wait costs the caller nothing.
+	if onCap {
+		if err, ok := waitWithin(waitC, killGrace); ok {
+			return remoteOf(c, err)
+		}
+	}
+
 	// Fire and forget: a wedged transport blocks these writes indefinitely,
 	// and the SSH signal request is a courtesy many servers ignore anyway.
 	go func() { _ = sess.Signal(ssh.SIGKILL) }()
 	go func() { _ = sess.Close() }()
-
-	// Only a cap breach lets the remote's own code win (SPEC 5.4), so only it
-	// pays for the wait.
-	if onCap {
-		if err, ok := waitWithin(waitC, killGrace); ok {
-			return ownExit(c, err)
-		}
-	}
 
 	// Abort's socket deadline is the guarantee that everything above unblocks.
 	c.Abort(teardownGrace)
@@ -124,13 +128,17 @@ func teardown(c *client.Conn, sess *ssh.Session, waitC <-chan error, onCap bool)
 	return nil
 }
 
-// ownExit keeps only a status the remote reached by itself. Servers that
-// honour the courtesy KILL above answer it with an exit-signal, and crediting
-// that to the remote would score every cap breach 128+9 instead of the 254
-// SPEC 5.4 asks for. Only a status that outran our own signal is the remote's.
+// ownExit keeps only a status the remote reached by itself. By the time it is
+// called the courtesy KILL and the channel close are away, so any signal that
+// comes back is teardown killing the command: KILL where the server honours
+// the request, PIPE where the closing channel took the writer down with it.
+// Crediting either to the remote would score a flood 128+n instead of the 254
+// SPEC 5.4 asks for. An ordinary exit status is the one thing teardown cannot
+// manufacture, so it is the one thing worth keeping. The two waits that run
+// before the kill take their status unfiltered.
 func ownExit(c *client.Conn, err error) *result.Remote {
 	remote := remoteOf(c, err)
-	if remote != nil && remote.Signal == string(ssh.SIGKILL) {
+	if remote != nil && remote.Signal != "" {
 		return nil
 	}
 	return remote
