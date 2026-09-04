@@ -2,6 +2,9 @@ package main
 
 import (
 	"crypto/ed25519"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"encoding/pem"
 	"fmt"
@@ -11,6 +14,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"syscall"
@@ -372,6 +376,53 @@ func lockedKey(t *testing.T, from string) string {
 		t.Fatal(err)
 	}
 	return path
+}
+
+// TestIntegrationPutInterruptedTransportFrozen is the other half: a connection
+// stalled hard enough that no request can leave. Nothing can be tidied over a
+// transport that has stopped carrying packets, so the guarantee narrows to the
+// one the spec actually makes, that the final name never appears.
+func TestIntegrationPutInterruptedTransportFrozen(t *testing.T) {
+	s := sshtest.Start(t)
+	direct := trusting(t, s)
+	dir := remoteDir(t, direct)
+	local := sparsePayload(t, interruptSize)
+
+	p := newFreezingProxy(t, s.Addr)
+	cfg := writeConfig(t, s, hostConfig{
+		knownHosts: fmt.Sprintf("[127.0.0.1]:%d %s\n", p.Port, authorizedKey(s.HostKey)),
+		port:       p.Port,
+	})
+	cmd := exec.Command(sshtest.Binary(t), "put", "h", "--max-size", "600MiB", "--timeout", "2s", local, dir+"/file")
+	cmd.Env = append(os.Environ(), "ERRAND_CONFIG="+cfg, "SSH_AUTH_SOCK=")
+	stderr := &strings.Builder{}
+	cmd.Stderr = stderr
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(300 * time.Millisecond)
+	p.Freeze()
+	start := time.Now()
+	err := cmd.Wait()
+	took := time.Since(start)
+
+	code := cmd.ProcessState.ExitCode()
+	t.Logf("exit %d in %v after the transport froze, stderr: %s", code, took, stderr)
+	if code != 254 {
+		t.Errorf("code=%d (%v), want 254", code, err)
+	}
+	// The 2s budget, then the 500ms cleanup window and the 2s teardown grace,
+	// doubled for CI.
+	if took > 10*time.Second {
+		t.Errorf("took %v: teardown waited on a transport that can never answer", took)
+	}
+	left := remote(t, direct, "ls -A "+dir)
+	t.Logf("after the freeze, ls -A %s = %q", dir, left)
+	for _, name := range strings.Fields(left) {
+		if name == "file" {
+			t.Errorf("the final name survives a frozen transfer: ls -A = %q", left)
+		}
+	}
 }
 
 func TestIntegrationRawDial(t *testing.T) {
@@ -1200,4 +1251,239 @@ func TestIntegrationAuditRecordsCheck(t *testing.T) {
 	if len(records) != 1 || records[0].Op != "check" || records[0].Status != "ok" || records[0].Command != "true" {
 		t.Errorf("check did not record itself:\n%s", raw)
 	}
+}
+
+// remoteDir gives each test its own directory under the container's /tmp, so
+// the tests sharing the one sshd cannot collide on a destination.
+func remoteDir(t *testing.T, cfg string) string {
+	t.Helper()
+	dir := "/tmp/" + strings.ReplaceAll(t.Name(), "/", "_")
+	remote(t, cfg, "rm -rf "+dir+" && mkdir -p "+dir)
+	return dir
+}
+
+// remote runs one command on the harness and returns its trimmed stdout.
+func remote(t *testing.T, cfg, command string) string {
+	t.Helper()
+	code, stdout, stderr := errand(t, cfg, "", "run", "h", "--", command)
+	if code != 0 {
+		t.Fatalf("%q: exit %d, stderr: %s", command, code, stderr)
+	}
+	return strings.TrimSpace(stdout)
+}
+
+// payload writes n bytes of incompressible filler and returns the path and its
+// checksum, so a round trip is checked against the source rather than against
+// another copy of the same bytes.
+func payload(t *testing.T, n int) (path, sum string) {
+	t.Helper()
+	b := make([]byte, n)
+	if _, err := rand.Read(b); err != nil {
+		t.Fatal(err)
+	}
+	path = filepath.Join(t.TempDir(), "payload")
+	if err := os.WriteFile(path, b, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	h := sha256.Sum256(b)
+	return path, hex.EncodeToString(h[:])
+}
+
+// TestIntegrationPutRoundTrip is the acceptance case: the bytes that arrive are
+// the bytes that left, the second put replaces the first, and the audit line
+// carries the transfer paths where a run carries its command.
+func TestIntegrationPutRoundTrip(t *testing.T) {
+	s := sshtest.Start(t)
+	cfg := trusting(t, s)
+	dir := remoteDir(t, cfg)
+	dst := dir + "/file"
+
+	const size = 1 << 20
+	local, sum := payload(t, size)
+	start := time.Now()
+	code, stdout, stderr := errand(t, cfg, "", "put", "h", local, dst)
+	took := time.Since(start)
+	if code != 0 || stdout != "" {
+		t.Fatalf("code=%d stdout=%q stderr=%q", code, stdout, stderr)
+	}
+	t.Logf("%d bytes in %v (%.1f MiB/s including connect)", size, took, float64(size)/(1<<20)/took.Seconds())
+	if got := remote(t, cfg, "sha256sum "+dst); !strings.HasPrefix(got, sum) {
+		t.Errorf("remote sha256 = %q, want %s", got, sum)
+	}
+	if got := remote(t, cfg, "ls -A "+dir); got != "file" {
+		t.Errorf("ls -A %s = %q, want just the destination", dir, got)
+	}
+
+	second, sum2 := payload(t, 4096)
+	if code, _, stderr := errand(t, cfg, "", "put", "h", second, dst); code != 0 {
+		t.Fatalf("second put: code=%d stderr=%q", code, stderr)
+	}
+	if got := remote(t, cfg, "sha256sum "+dst); !strings.HasPrefix(got, sum2) {
+		t.Errorf("after replacing, remote sha256 = %q, want %s", got, sum2)
+	}
+
+	records, raw := auditLog(t, cfg)
+	i := slices.IndexFunc(records, func(r auditRecord) bool { return r.Op == "put" })
+	if i < 0 {
+		t.Fatalf("no put in the audit log:\n%s", raw)
+	}
+	rec := records[i]
+	switch {
+	case rec.Op != "put":
+		t.Errorf("audit op = %q, want put", rec.Op)
+	case rec.Command != local+" "+dst:
+		t.Errorf("audit command = %q, want the transfer paths", rec.Command)
+	case rec.Status != "ok" || rec.ExitCode != 0:
+		t.Errorf("audit status=%q exit_code=%d", rec.Status, rec.ExitCode)
+	case rec.StdoutBytes != size:
+		t.Errorf("audit stdout_bytes = %d, want %d", rec.StdoutBytes, size)
+	}
+	if t.Failed() {
+		t.Logf("audit log:\n%s", raw)
+	}
+}
+
+func TestIntegrationPutMode(t *testing.T) {
+	s := sshtest.Start(t)
+	cfg := trusting(t, s)
+	for _, tc := range []struct{ flag, want string }{
+		{"", "644"},
+		{"0755", "755"},
+		{"600", "600"},
+	} {
+		t.Run("mode "+tc.flag, func(t *testing.T) {
+			dir := remoteDir(t, cfg)
+			local, _ := payload(t, 64)
+			args := []string{"put", "h"}
+			if tc.flag != "" {
+				args = append(args, "--mode", tc.flag)
+			}
+			args = append(args, local, dir+"/file")
+			if code, _, stderr := errand(t, cfg, "", args...); code != 0 {
+				t.Fatalf("code=%d stderr=%q", code, stderr)
+			}
+			if got := remote(t, cfg, "stat -c %a "+dir+"/file"); got != tc.want {
+				t.Errorf("remote mode = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestIntegrationPutOverMaxSize checks the rejection happens before the
+// connection is used for anything: nothing at all appears in the destination.
+func TestIntegrationPutOverMaxSize(t *testing.T) {
+	s := sshtest.Start(t)
+	cfg := trusting(t, s)
+	dir := remoteDir(t, cfg)
+	local, _ := payload(t, 1<<20)
+	code, _, stderr := errand(t, cfg, "", "put", "h", "--max-size", "512KiB", local, dir+"/file")
+	if code != 250 {
+		t.Fatalf("code=%d, want 250; stderr=%q", code, stderr)
+	}
+	if !strings.Contains(stderr, "--max-size") || !strings.Contains(stderr, "1048576") {
+		t.Errorf("stderr=%q, want the size and the flag that rejected it", stderr)
+	}
+	if got := remote(t, cfg, "ls -A "+dir); got != "" {
+		t.Errorf("ls -A %s = %q, want nothing", dir, got)
+	}
+}
+
+func TestIntegrationPutFailures(t *testing.T) {
+	s := sshtest.Start(t)
+	cfg := trusting(t, s)
+	dir := remoteDir(t, cfg)
+	local, _ := payload(t, 64)
+	for _, tc := range []struct {
+		name, local, remote string
+		code                int
+		want                string
+	}{
+		{"missing local file", filepath.Join(t.TempDir(), "absent"), dir + "/file", 250, "usage"},
+		{"missing remote directory", local, dir + "/absent/file", 253, "transfer"},
+		{"unwritable remote path", local, "/proc/nope/file", 253, "transfer"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			code, _, stderr := errand(t, cfg, "", "put", "h", tc.local, tc.remote)
+			if code != tc.code {
+				t.Fatalf("code=%d, want %d; stderr=%q", code, tc.code, stderr)
+			}
+			if !strings.Contains(stderr, "errand: h: "+tc.want+": ") {
+				t.Errorf("stderr=%q, want a %s phase", stderr, tc.want)
+			}
+		})
+	}
+	if got := remote(t, cfg, "ls -A "+dir); got != "" {
+		t.Errorf("ls -A %s = %q, want nothing", dir, got)
+	}
+}
+
+// TestIntegrationPutInterrupted is the half of the guarantee that matters: a
+// transfer cut mid-flight leaves nothing under the final name. The temp file is
+// unlinked in the same window where possible, which over loopback it is; the
+// test records what the destination actually holds either way.
+func TestIntegrationPutInterrupted(t *testing.T) {
+	s := sshtest.Start(t)
+	cfg := trusting(t, s)
+	dir := remoteDir(t, cfg)
+	local := sparsePayload(t, interruptSize)
+
+	start := time.Now()
+	code, stdout, stderr := errand(t, cfg, "", "put", "h", "--json",
+		"--max-size", "600MiB", "--timeout", interruptAfter.String(), local, dir+"/file")
+	took := time.Since(start)
+	_, env := splitEnvelope(t, stdout)
+	t.Logf("cut after %d of %d bytes (%.0f%%) in %v", env.StdoutBytes, interruptSize,
+		100*float64(env.StdoutBytes)/interruptSize, took)
+	if code != 254 || env.Status != "timeout" {
+		t.Fatalf("code=%d status=%q, want 254 and timeout (a %d-byte put should not finish in %v); stderr=%q",
+			code, env.Status, interruptSize, interruptAfter, stderr)
+	}
+	if !strings.Contains(stderr, "timeout") {
+		t.Errorf("stderr=%q, want a timeout diagnostic", stderr)
+	}
+	// Without this the test would still pass if the cut landed during the
+	// handshake, having proved nothing about a transfer in flight.
+	if env.StdoutBytes <= 0 || env.StdoutBytes >= interruptSize {
+		t.Fatalf("cut after %d bytes, want a cut partway through %d", env.StdoutBytes, interruptSize)
+	}
+	if took > interruptAfter+5*time.Second {
+		t.Errorf("took %v, want the budget plus a bounded teardown", took)
+	}
+	left := remote(t, cfg, "ls -A "+dir)
+	t.Logf("after the cut, ls -A %s = %q", dir, left)
+	if strings.Contains(left, "\nfile") || left == "file" {
+		t.Errorf("the final name survives a cut transfer: ls -A = %q", left)
+	}
+	if left != "" {
+		t.Errorf("the temp file survives a cut transfer: ls -A = %q", left)
+	}
+}
+
+// interruptSize and interruptAfter are measured, not guessed. Loopback to the
+// container moves about 380 MiB/s, so 512 MiB is well over a second of
+// transfer and the cut lands around a third of the way in. The margin is
+// deliberately wide: the way this test goes wrong is a machine fast enough to
+// finish before the budget, and the assertion on the byte count catches the
+// opposite mistake of cutting before the transfer began.
+const (
+	interruptSize  = 512 << 20
+	interruptAfter = 500 * time.Millisecond
+)
+
+// sparsePayload is a file of that many zero bytes that costs nothing to create
+// and nothing to read: the transfer still has to move every one of them.
+func sparsePayload(t *testing.T, n int64) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "payload")
+	f, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Truncate(n); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return path
 }
