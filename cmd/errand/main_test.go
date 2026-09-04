@@ -8,6 +8,7 @@ import (
 	"flag"
 	"io"
 	"os"
+	"regexp"
 	"slices"
 	"strings"
 	"testing"
@@ -294,6 +295,30 @@ func TestPutModeIsParsedAsOctal(t *testing.T) {
 			t.Errorf("--mode %q: %v", tc.arg, err)
 		case !tc.bad && o.mode != tc.want:
 			t.Errorf("--mode %q = %04o, want %04o", tc.arg, o.mode, tc.want)
+		}
+	}
+}
+
+// TestReadmeFlagTablesMatchUsage keeps the README's flag tables and the usage
+// text naming the same flags, in both directions.
+func TestReadmeFlagTablesMatchUsage(t *testing.T) {
+	readme, err := os.ReadFile("../../README.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	inReadme := map[string]bool{}
+	for _, m := range regexp.MustCompile("(?m)^\\| `(--[a-z-]+)").FindAllStringSubmatch(string(readme), -1) {
+		inReadme[m[1]] = true
+		if !regexp.MustCompile(`(?m)^  ` + m[1] + `( |$)`).MatchString(usage) {
+			t.Errorf("README documents %s, usage does not list it", m[1])
+		}
+	}
+	if len(inReadme) == 0 {
+		t.Fatal("no flag rows found in README")
+	}
+	for _, m := range regexp.MustCompile(`(?m)^  (--[a-z-]+)`).FindAllStringSubmatch(usage, -1) {
+		if !inReadme[m[1]] {
+			t.Errorf("usage lists %s, the README's flag tables do not", m[1])
 		}
 	}
 }
