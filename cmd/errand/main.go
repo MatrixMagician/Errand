@@ -72,23 +72,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("errand "+sub, flag.ContinueOnError)
 	fs.SetOutput(io.Discard) // we print errors ourselves with the errand: prefix
 	fs.Usage = func() {}     // printed by us: on -h below, never on a parse error
-	var stdin, pty, quiet bool
-	var env envFlag
-	var timeout, connectTimeout time.Duration
-	var maxOutput int64
-	if sub == "run" {
-		fs.BoolVar(&stdin, "stdin", false, "stream local stdin to the remote command")
-		fs.BoolVar(&pty, "pty", false, "request a PTY")
-		fs.BoolVar(&quiet, "quiet", false, "suppress errand's own diagnostics")
-		fs.Var(&env, "env", "KEY=VAL to set on the remote command; repeatable")
-		fs.DurationVar(&timeout, "timeout", 0, "wall-clock limit for the whole invocation")
-		fs.DurationVar(&connectTimeout, "connect-timeout", defaultConnectTimeout, "limit for TCP, handshake and auth")
-		fs.Func("max-output", "combined cap across stdout and stderr; 0 disables", func(v string) error {
-			var err error
-			maxOutput, err = config.ParseSize(v)
-			return err
-		})
-	}
+	o := registerFlags(fs, sub)
 	if err := fs.Parse(rest); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			fmt.Fprint(stdout, usage)
@@ -115,7 +99,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 	}
 	// Only now is --quiet known. Everything above it is a usage error, which
 	// is the one diagnostic an operator needs whether they asked for it or not.
-	diag = diagnostics(stderr, quiet)
+	diag = diagnostics(stderr, o.quiet)
 	h, err := cfg.Resolve(alias)
 	if err != nil {
 		return fail(diag, result.Resolve, alias, err)
@@ -129,25 +113,56 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return fail(diag, result.Usage, "", errors.New("run: missing <command>"))
 	}
 	var in io.Reader
-	if stdin {
+	if o.stdin {
 		in = os.Stdin
 	}
 	if !given(fs, "timeout") {
-		timeout = h.Timeout
+		o.timeout = h.Timeout
 	}
 	if !given(fs, "max-output") {
-		maxOutput = int64(h.MaxOutput)
+		o.maxOutput = int64(h.MaxOutput)
 	}
 	ctx, stop := interruptible(context.Background())
 	defer stop()
-	res := attempt(ctx, h, timeout, connectTimeout, diag, func(ctx context.Context, c *client.Conn) result.Result {
+	res := attempt(ctx, h, o.timeout, o.connectTimeout, diag, func(ctx context.Context, c *client.Conn) result.Result {
 		return exec.Run(ctx, c, exec.Request{
 			Command: command, Stdin: in, Stdout: stdout, Stderr: stderr,
-			MaxOutput: maxOutput, Env: env, PTY: pty,
+			MaxOutput: o.maxOutput, Env: o.env, PTY: o.pty,
 		})
 	})
 	res.Op = "run"
 	return finish(res, diag)
+}
+
+// options are the flag values a subcommand accepts. registerFlags owns which
+// subcommand declares which, so the flags run and check share are described in
+// exactly one place.
+type options struct {
+	stdin, pty, quiet       bool
+	env                     envFlag
+	timeout, connectTimeout time.Duration
+	maxOutput               int64
+}
+
+func registerFlags(fs *flag.FlagSet, sub string) *options {
+	var o options
+	if sub != "run" && sub != "check" {
+		return &o
+	}
+	fs.BoolVar(&o.quiet, "quiet", false, "suppress errand's own diagnostics")
+	fs.DurationVar(&o.timeout, "timeout", 0, "wall-clock limit for the whole invocation")
+	fs.DurationVar(&o.connectTimeout, "connect-timeout", defaultConnectTimeout, "limit for TCP, handshake and auth")
+	if sub == "run" {
+		fs.BoolVar(&o.stdin, "stdin", false, "stream local stdin to the remote command")
+		fs.BoolVar(&o.pty, "pty", false, "request a PTY")
+		fs.Var(&o.env, "env", "KEY=VAL to set on the remote command; repeatable")
+		fs.Func("max-output", "combined cap across stdout and stderr; 0 disables", func(v string) error {
+			var err error
+			o.maxOutput, err = config.ParseSize(v)
+			return err
+		})
+	}
+	return &o
 }
 
 // defaultConnectTimeout bounds TCP, handshake and auth (SPEC 4.1). Unlike
