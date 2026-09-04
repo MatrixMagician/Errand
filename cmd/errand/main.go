@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/signal"
 	"runtime/debug"
+	"strconv"
 	"strings"
 	"syscall"
 	"text/tabwriter"
@@ -21,6 +22,7 @@ import (
 	"github.com/MatrixMagician/Errand/internal/envelope"
 	"github.com/MatrixMagician/Errand/internal/exec"
 	"github.com/MatrixMagician/Errand/internal/result"
+	"github.com/MatrixMagician/Errand/internal/transfer"
 )
 
 // version is overridden at build time: -ldflags "-X main.version=v1.2.3".
@@ -34,7 +36,7 @@ const usage = `usage:
   errand hosts                                  list declared hosts and resolved parameters
   errand version                                print the version
 
-flags for run and check:
+flags for run, put and check:
   --timeout <dur>                               wall-clock limit for the whole invocation
   --connect-timeout <dur>                       limit for TCP, handshake and auth, within --timeout
   --quiet                                       suppress errand's own diagnostics, never the remote's
@@ -45,6 +47,10 @@ flags for run only:
   --max-output <bytes>                          combined cap across stdout and stderr; 0 disables
   --env KEY=VAL                                 set a remote environment variable; repeatable
   --pty                                         request a PTY for tools that refuse to run without one
+
+flags for put only:
+  --mode <octal>                                permission bits for the remote file; default 0644
+  --max-size <bytes>                            reject a larger local file before sending; default 64MiB
 
 <host> is an alias declared in the config file (default ~/.config/errand/config.toml,
 overridable with ERRAND_CONFIG). Exit 250 on usage or configuration errors.
@@ -115,12 +121,9 @@ func run(args []string, stdout, stderr io.Writer) int {
 	if err != nil {
 		return fail(diag, env, result.Resolve, alias, err)
 	}
-	if sub != "run" && sub != "check" {
-		return fail(diag, env, result.Usage, "", fmt.Errorf("%s: not implemented", sub))
-	}
-
-	var req exec.Request
-	if sub == "run" {
+	var body func(context.Context, *client.Conn) result.Result
+	switch sub {
+	case "run":
 		command := strings.Join(fs.Args(), " ")
 		if command == "" {
 			return fail(diag, env, result.Usage, "", errors.New("run: missing <command>"))
@@ -138,27 +141,37 @@ func run(args []string, stdout, stderr io.Writer) int {
 		if env != nil {
 			out = env
 		}
-		req = exec.Request{
+		req := exec.Request{
 			Command: command, Stdin: in, Stdout: out, Stderr: stderr,
 			MaxOutput: o.maxOutput, Env: o.env, PTY: o.pty,
 		}
-	} else {
+		body = func(ctx context.Context, c *client.Conn) result.Result { return exec.Run(ctx, c, req) }
+	case "check":
 		if fs.NArg() > 0 {
 			return fail(diag, env, result.Usage, "", fmt.Errorf("check: takes no command, got %q", fs.Arg(0)))
 		}
 		// check is run with the question narrowed to the connection: a command
 		// every host has, and both streams discarded, so the only thing the
 		// caller learns is whether errand could get there and back.
-		req = exec.Request{Command: "true", Stdout: io.Discard, Stderr: io.Discard}
+		req := exec.Request{Command: "true", Stdout: io.Discard, Stderr: io.Discard}
+		body = func(ctx context.Context, c *client.Conn) result.Result { return exec.Run(ctx, c, req) }
+	case "put":
+		if fs.NArg() != 2 {
+			return fail(diag, env, result.Usage, "", fmt.Errorf("put: want <local> <remote>, got %d arguments", fs.NArg()))
+		}
+		local, remote := fs.Arg(0), fs.Arg(1)
+		body = func(ctx context.Context, c *client.Conn) result.Result {
+			return transfer.Put(ctx, c, local, remote, o.mode, o.maxSize)
+		}
+	default:
+		return fail(diag, env, result.Usage, "", fmt.Errorf("%s: not implemented", sub))
 	}
 	if !given(fs, "timeout") {
 		o.timeout = h.Timeout
 	}
 	ctx, stop := interruptible(context.Background())
 	defer stop()
-	res := attempt(ctx, h, o.timeout, o.connectTimeout, diag, func(ctx context.Context, c *client.Conn) result.Result {
-		return exec.Run(ctx, c, req)
-	})
+	res := attempt(ctx, h, o.timeout, o.connectTimeout, diag, body)
 	res.Op = sub
 	if sub == "check" && res.ExitCode() == 0 {
 		diag("ok %s connect=%dms", res.Target, res.Connect.Milliseconds())
@@ -167,31 +180,49 @@ func run(args []string, stdout, stderr io.Writer) int {
 }
 
 // options are the flag values a subcommand accepts. registerFlags owns which
-// subcommand declares which, so the flags run and check share are described in
+// subcommand declares which, so the flags run, put and check share are described in
 // exactly one place.
 type options struct {
 	stdin, pty, quiet, json bool
 	env                     envFlag
 	timeout, connectTimeout time.Duration
-	maxOutput               int64
+	maxOutput, maxSize      int64
+	mode                    os.FileMode
 }
 
 func registerFlags(fs *flag.FlagSet, sub string) *options {
-	var o options
-	if sub != "run" && sub != "check" {
+	o := options{mode: defaultMode, maxSize: int64(defaultMaxSize)}
+	switch sub {
+	case "run", "put", "check":
+	default:
 		return &o
 	}
 	fs.BoolVar(&o.quiet, "quiet", false, "suppress errand's own diagnostics")
 	fs.BoolVar(&o.json, "json", false, "write a JSON result envelope as the final line of stdout")
 	fs.DurationVar(&o.timeout, "timeout", 0, "wall-clock limit for the whole invocation")
 	fs.DurationVar(&o.connectTimeout, "connect-timeout", defaultConnectTimeout, "limit for TCP, handshake and auth")
-	if sub == "run" {
+	switch sub {
+	case "run":
 		fs.BoolVar(&o.stdin, "stdin", false, "stream local stdin to the remote command")
 		fs.BoolVar(&o.pty, "pty", false, "request a PTY")
 		fs.Var(&o.env, "env", "KEY=VAL to set on the remote command; repeatable")
 		fs.Func("max-output", "combined cap across stdout and stderr; 0 disables", func(v string) error {
 			var err error
 			o.maxOutput, err = config.ParseSize(v)
+			return err
+		})
+	case "put":
+		fs.Func("mode", "octal permission bits for the remote file", func(v string) error {
+			bits, err := strconv.ParseUint(v, 8, 32)
+			if err != nil {
+				return fmt.Errorf("want octal permission bits, got %q", v)
+			}
+			o.mode = os.FileMode(bits)
+			return nil
+		})
+		fs.Func("max-size", "reject a larger local file before sending", func(v string) error {
+			var err error
+			o.maxSize, err = config.ParseSize(v)
 			return err
 		})
 	}
@@ -201,6 +232,12 @@ func registerFlags(fs *flag.FlagSet, sub string) *options {
 // defaultConnectTimeout bounds TCP, handshake and auth (SPEC 4.1). Unlike
 // --timeout it has no per-host setting, so the built-in is the only default.
 const defaultConnectTimeout = 10 * time.Second
+
+// Transfer defaults (SPEC §9). Neither has a per-host setting either.
+const (
+	defaultMode    = os.FileMode(0o644)
+	defaultMaxSize = config.Size(64 << 20)
+)
 
 // given reports whether the flag was set on the command line, which is how
 // "flag overrides configuration" is decided for a flag whose zero value is
