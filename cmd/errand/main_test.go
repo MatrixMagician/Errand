@@ -68,7 +68,9 @@ func TestUnknownAliasNamesAliasAndPath(t *testing.T) {
 
 func TestMalformedConfig(t *testing.T) {
 	p := t.TempDir() + "/bad.toml"
-	os.WriteFile(p, []byte("[hosts.a]\nhostname = \"x\n"), 0o600)
+	if err := os.WriteFile(p, []byte("[hosts.a]\nhostname = \"x\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	t.Setenv("ERRAND_CONFIG", p)
 	code, _, stderr := exec(t, "hosts")
 	if code != 250 || !strings.Contains(stderr, "line 2") {
