@@ -41,10 +41,21 @@ type Conn struct {
 // aborted handshake reported.
 func Dial(ctx context.Context, h config.Host, diag Diag) (*Conn, error) {
 	c, err := dial(ctx, h, diag)
-	if err != nil && ctx.Err() != nil {
+	if err != nil && stopped(ctx) {
 		return nil, result.StopCause(ctx)
 	}
 	return c, err
+}
+
+// stopped reports whether ctx has run out. The deadline is checked as well as
+// Err because a dial fails on the socket deadline net sets from ctx, which can
+// land fractionally before ctx's own timer marks it done.
+func stopped(ctx context.Context) bool {
+	if ctx.Err() != nil {
+		return true
+	}
+	deadline, ok := ctx.Deadline()
+	return ok && !time.Now().Before(deadline)
 }
 
 func dial(ctx context.Context, h config.Host, diag Diag) (*Conn, error) {
