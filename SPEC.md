@@ -23,7 +23,7 @@ Errand is a small, deliberately boring SSH client that fixes exactly these probl
 2. Never prompt for anything under any circumstances. All authentication material comes from the SSH agent or unencrypted-or-agent-loaded key files; anything else is an immediate, clearly reported failure.
 3. Make client-side failures (connect, auth, host key, timeout) distinguishable from remote command failures, both via exit codes and via an optional JSON result envelope.
 4. Enforce configurable timeouts (connect and overall command) and output caps by default.
-5. Restrict execution to hosts explicitly declared in configuration, so an agent can only touch machines the operator has listed.
+5. Restrict execution to hosts explicitly declared in configuration, so an agent can only touch machines the operator has listed. An operator can further list, per host, the commands an agent may run without a human approving each one; Errand reports the verdict and the harness enforces it (§16).
 6. Provide basic SFTP `put`/`get` so the agent can ship scripts out and pull artefacts back.
 7. Keep an append-only audit log of every command run.
 8. Ship as a single static binary for Linux (amd64 and arm64).
@@ -44,6 +44,7 @@ errand run   <host> [flags] -- <command...>     # execute a command
 errand put   <host> [flags] <local> <remote>    # upload a file (SFTP)
 errand get   <host> [flags] <remote> <local>    # download a file (SFTP)
 errand check <host> [flags]                     # preflight: resolve, connect, authenticate, run 'true'
+errand allow <subcommand> [args...]             # would the invocation be unattended? exit 0 yes, 1 no
 errand hosts                                    # list declared hosts and their resolved parameters
 errand version
 ```
@@ -185,9 +186,9 @@ v1 opens one connection per invocation. That is an honest cost — roughly 100�
 - TCP keepalive plus an SSH-level `keepalive@openssh.com` global request every 30 s while a command runs, so long-running commands survive stateful firewalls.
 - `errand check <host>` as a cheap preflight the agent can call once per session before committing to a plan.
 
-A multiplexing mode (a small background holder process per host, ControlMaster-style, with an idle timeout) is sketched as Milestone 5 and should only be built if per-command latency proves to be a real problem in practice. Do not build it speculatively; a daemon triples the surface area of a tool whose whole virtue is having almost none.
+A multiplexing mode (a small background holder process per host, ControlMaster-style, with an idle timeout) is sketched as Milestone 6 and should only be built if per-command latency proves to be a real problem in practice. Do not build it speculatively; a daemon triples the surface area of a tool whose whole virtue is having almost none.
 
-ProxyJump-style bastion hops are likewise deferred (Milestone 5): the `x/crypto/ssh` client can dial through a first connection with `NewClientConn` over a forwarded TCP channel, and the configuration shape (`via = "bastion"` on a host stanza, one level deep, no chains in v1) should be reserved now so it slots in without breaking the file format.
+ProxyJump-style bastion hops are likewise deferred (Milestone 6): the `x/crypto/ssh` client can dial through a first connection with `NewClientConn` over a forwarded TCP channel, and the configuration shape (`via = "bastion"` on a host stanza, one level deep, no chains in v1) should be reserved now so it slots in without breaking the file format.
 
 ## 12. Implementation notes
 
@@ -216,7 +217,9 @@ Each milestone ends with the binary building, tests green, and the listed accept
 
 **M4 — SFTP.** `put`/`get` per §9 with temp-and-rename, `--mode`, `--max-size`. Acceptance: round-trip a file with a checksum compare; interrupt a `put` mid-transfer and verify no partial file exists under the final name.
 
-**M5 (optional, only on demonstrated need) — Multiplexing and bastion hops.** Per §11.
+**M5 — Command allowlist and harness integration.** `allow_commands` per §16, `errand allow`, and `contrib/claude-code` (hook, skill, settings snippet). Acceptance: the in-process CLI tests cover every fixed verdict, every failing construct with its reason, prefix entries, basename matching, a quoted `|`, a host list replacing the default list, an empty list refusing everything, and `allow` leaving the audit log untouched; the hook script runs in CI against the built binary and yields an allow decision only for a listed, single `errand` command; by hand, with a starter list on a lab host, Claude Code runs `errand run lab -- df -h` with no prompt, is prompted for `errand run lab -- sudo journalctl` and for `errand put`, and is refused `ssh`.
+
+**M6 (optional, only on demonstrated need) — Multiplexing and bastion hops.** Per §11.
 
 ## 14. Testing strategy
 
@@ -227,3 +230,19 @@ Unit-test config resolution, exit code mapping, envelope serialisation, and the 
 1. Should `--env` exist in v1 at all, given that most sshd deployments reject unlisted names via `AcceptEnv` and the failure is silent on some servers? Cutting it simplifies the surface; keeping it helps the `TERM`/locale odd cases. Default position: keep, document the caveat.
 2. macOS client support is assumed free with Go cross-compilation — confirm the agent socket and known_hosts paths need no special-casing beyond `$HOME` expansion.
 3. Is 1 MiB the right default output cap for agent use, or should the default be lower (256 KiB) with the expectation that the agent raises it deliberately when it means to?
+
+## 16. Command allowlist and `errand allow`
+
+An operator lists, per host, the commands an agent may run without a human approving each one. Errand evaluates the list and reports the verdict; it never enforces it (ADR-0003). `run`, `put`, and `get` do not consult the list, so a command a human approved at a prompt runs.
+
+**Configuration.** `allow_commands`, a list of strings, under `[defaults]` and `[hosts.<alias>]`. Resolution follows §7: the host's list when set, else the default list, else empty. A host list replaces the default list. There is no flag for it and no built-in list, so a fresh install asks about everything.
+
+**Entries.** One or more words. A pipeline segment matches an entry when the segment's leading words equal the entry's words, with the first word compared by basename. Words match exactly; no globs, no regular expressions.
+
+**Evaluation.** The command judged is the string `run` would send. It is tokenised with POSIX quoting (single quotes, double quotes, backslash) and split into segments on unquoted `|`. Every segment must match an entry. The check fails with a fixed reason on: a segment matching no entry (`not on allowlist: <leading words>`); unquoted `>`, `>>`, `<` (`redirection`); unquoted `;`, `&`, `&&`, `||`, or newline (`control operator`); `$(` or a backtick outside single quotes (`substitution`); a segment starting with `sudo` (`sudo`); a first word containing `=` (`env prefix`); an unbalanced quote, a trailing backslash, or an empty segment (`unparseable`). Segments are judged left to right and the first failure is reported. Nothing beyond a plain pipeline is understood, on purpose: what the check does not understand fails, and a failure is a prompt.
+
+**`errand allow <subcommand> [args...]`.** Takes the exact tail of an `errand` invocation. `hosts`, `version`, `help`, `check`, and `get` are always unattended. `put` never is, with reason `put`. `run` is judged by its command, with or without the `--` separator, exactly as `run` reads it. Flags are parsed with the judged subcommand's flag set and do not change the verdict, so an invalid flag is a usage error. Exit 0 and nothing on stdout when unattended. Exit 1 and one reason line on stdout otherwise. Exit 250 with the usual diagnostics for a missing or unknown subcommand, a flag error, a configuration error, or an unknown alias. `allow` never connects, never writes the audit log, and ignores `--json` for its own output.
+
+**Harness integration.** A harness with a pre-execution hook calls `allow` and turns exit 0 into an automatic approval; every other outcome falls through to its normal permission prompt, which is how "ask" is expressed. The repository ships this for Claude Code under `contrib/claude-code`: a PreToolUse hook in standard-library Python that only ever answers "allow", a usage-only skill that steers Claude to Errand, and a settings snippet that registers the hook and denies `ssh`, `scp`, `sftp`, and `rsync`. The hook acts only on a Bash command that is one simple `errand` invocation; a compound command, a redirection, or an expansion gets no decision.
+
+**Remote-side hardening.** A `command=` forced key or a restricted shell in the host's `authorized_keys` is documented as optional. It is the one gate a confused agent cannot route around, and it is independent of the client-side list.

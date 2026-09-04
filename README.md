@@ -189,7 +189,7 @@ host_key = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI..."
 | `user` | string | the local `$USER` | Login name for hosts that do not set their own. |
 | `timeout` | duration | `120s` | `--timeout` for hosts that do not set their own. |
 | `max_output` | size | `1MiB` | `--max-output` for hosts that do not set their own. |
-| `allow_commands` | list of strings | none | Commands an agent may run Unattended, for hosts that do not set their own list. |
+| `allow_commands` | list of strings | none | Commands an agent may run Unattended, for hosts that do not set their own list. See [Command allowlist](#command-allowlist). |
 | `known_hosts` | string or list of strings | none | Files to verify host keys against, in OpenSSH format. Files that do not exist are skipped. With no readable file, every host key is unknown. |
 | `identity_files` | string or list of strings | none | Private key files to try after the SSH agent, in order. |
 | `audit_log` | string | `$XDG_STATE_HOME/errand/audit.jsonl`, else `~/.local/state/errand/audit.jsonl` | Where operations are recorded. |
@@ -223,6 +223,53 @@ db-restore  db2.example.net   22    oliverh  2m0s     1MiB        no          ss
 lab         10.20.0.5         22    oliverh  2m0s     1MiB        yes         -
 web-prod    web1.example.net  22    deploy   1m0s     1MiB        no          -
 ```
+
+## Command allowlist
+
+`allow_commands` lists the commands an agent may run on a host without a human approving each one. `errand` never enforces it. `run`, `put`, and `get` do what they are told whether or not the command is listed. What the list changes is the answer `errand allow` gives, and a harness such as [Claude Code](#claude-code) turns that answer into "run it" or "ask me". Errand cannot ask, which is why the decision lives outside it (ADR-0003).
+
+Set the list under `[defaults]` for every host, or under `[hosts.<alias>]` for one. A host's list replaces the default list rather than adding to it, and `allow_commands = []` on a host allows nothing there. With no list anywhere, every command asks.
+
+A starter list for hosts you only read from:
+
+```toml
+[defaults]
+allow_commands = [
+  "ls", "cat", "head", "tail", "grep", "find", "stat", "file", "wc", "du", "df",
+  "free", "uptime", "uname", "hostname", "id", "whoami", "date", "env", "ps",
+  "top -b -n 1", "ss", "ip",
+  "systemctl status", "systemctl is-active", "systemctl list-units",
+  "journalctl", "dmesg",
+  "docker ps", "docker logs",
+  "git status", "git log", "git diff",
+]
+```
+
+### What passes
+
+An entry is one or more words. `cat` matches any invocation of `cat`. `systemctl status` matches `systemctl status nginx` and not `systemctl restart nginx`. Words match exactly; there are no globs and no regular expressions. The first word of a command is compared by its last path element, so `/usr/bin/cat` matches `cat`.
+
+The command judged is the string `run` would send, split into words the way a POSIX shell does it: single quotes, double quotes, and backslashes are honoured, so a `|` inside quotes is text. The words are split into pipeline segments on each unquoted `|`, and every segment has to start with a listed entry. `ps aux | grep nginx` passes with `ps` and `grep` listed. `cat x | sh` does not.
+
+### What fails, and the reason `allow` prints
+
+| The command has | Reason on stdout |
+|---|---|
+| a segment whose leading words match no entry | `not on allowlist: <leading words>` |
+| an unquoted `>`, `>>`, or `<` | `redirection` |
+| an unquoted `;`, `&`, `&&`, `\|\|`, or newline | `control operator` |
+| `$(` or a backtick outside single quotes | `substitution` |
+| a segment that starts with `sudo` | `sudo` |
+| a first word containing `=`, as in `LANG=C grep` | `env prefix` |
+| an unbalanced quote, a trailing backslash, or an empty segment | `unparseable` |
+
+Segments are judged left to right and the first failure is the one printed. `$(` and backticks fail inside double quotes as well, because the remote shell expands them there. A plain `$HOME` is text and passes.
+
+The rules stop at a plain pipeline on purpose. Anything the check does not understand fails, and a failure costs a prompt, never a surprise. When a construct you need is refused, loosen the list, not the rules.
+
+### Verdicts by subcommand
+
+`hosts`, `version`, `help`, `check`, and `get` always pass. `put` never does, with the reason `put`. `run` is judged by its command. Flags such as `--json`, `--quiet`, `--stdin`, `--env`, and `--timeout` leave the verdict alone, but they still have to parse, so a bad flag is exit 250 exactly as it would be for the subcommand itself. `allow` never connects and writes nothing to the audit log.
 
 ## Host keys
 
@@ -358,3 +405,19 @@ The hook decides from the command string alone and declines anything Bash would 
 ```
 
 Any other rewriting hook needs the same treatment: whatever it turns `ssh` into is what the deny rule has to name.
+
+## Hardening the remote side
+
+The allowlist is judged on the machine the agent runs on, by a hook. An agent that finds another way to run `errand`, or another SSH client, has stepped around it. The one gate an agent cannot step around is on the host itself, and it is optional. Two ways to build one:
+
+A forced command. In the host's `~/.ssh/authorized_keys`, prefix the agent's key with `command="..."`. sshd then runs that command for every connection made with this key, whatever the client asked for, and hands the client's request to it in `SSH_ORIGINAL_COMMAND`. A short script there can hold the same list and refuse the rest:
+
+```
+command="/usr/local/bin/errand-gate",no-port-forwarding,no-agent-forwarding,no-X11-forwarding ssh-ed25519 AAAA... agent@laptop
+```
+
+`errand check` runs `true`, `put` and `get` request the `sftp` subsystem, and `run` sends the command string, so the gate has to let the first two through as well as the listed commands.
+
+A restricted shell. Give the agent's account a login shell that knows a fixed set of commands, such as `rbash` with a curated `PATH`. Coarser than a forced command, with no script to write.
+
+The two lists do different jobs. `allow_commands` on the client decides what a human is asked about. The gate on the host decides what can happen at all, and it holds when the client side is misconfigured or bypassed. Keep the host-side gate at least as strict as the client-side list, and let the client-side list be the one you tune.
