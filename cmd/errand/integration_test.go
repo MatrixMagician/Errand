@@ -27,6 +27,7 @@ type hostConfig struct {
 	hostname   string
 	port       int
 	timeout    string
+	maxOutput  string
 }
 
 func writeConfig(t *testing.T, s *sshtest.Server, o hostConfig) string {
@@ -44,9 +45,12 @@ func writeConfig(t *testing.T, s *sshtest.Server, o hostConfig) string {
 	for i, p := range o.identities {
 		quoted[i] = strconv.Quote(p)
 	}
-	timeout := ""
+	settings := ""
 	if o.timeout != "" {
-		timeout = fmt.Sprintf("timeout  = %q\n", o.timeout)
+		settings += fmt.Sprintf("timeout    = %q\n", o.timeout)
+	}
+	if o.maxOutput != "" {
+		settings += fmt.Sprintf("max_output = %q\n", o.maxOutput)
 	}
 	dir := t.TempDir()
 	kh := sshtest.WriteFile(t, dir, "known_hosts", o.knownHosts)
@@ -58,7 +62,7 @@ identity_files = [%s]
 [hosts.h]
 hostname = %q
 port     = %d
-%s`, kh, strings.Join(quoted, ", "), o.hostname, o.port, timeout))
+%s`, kh, strings.Join(quoted, ", "), o.hostname, o.port, settings))
 }
 
 // trusting is the configuration in which everything should work.
@@ -459,5 +463,90 @@ func (p *freezingProxy) pipe(dst, src net.Conn) {
 		if err != nil {
 			return
 		}
+	}
+}
+
+func TestIntegrationRunOutputCap(t *testing.T) {
+	s := sshtest.Start(t)
+	start := time.Now()
+	code, stdout, stderr := errand(t, trusting(t, s), "", "run", "h", "--max-output", "64KiB", "--", "yes")
+	took := time.Since(start)
+	t.Logf("exit %d in %v with %d stdout bytes, stderr: %s", code, took, len(stdout), stderr)
+	if code != 254 {
+		t.Errorf("code=%d, want 254: the remote never exited on its own", code)
+	}
+	if len(stdout) != 65536 {
+		t.Errorf("delivered %d stdout bytes, want exactly the 65536-byte cap", len(stdout))
+	}
+	if !strings.Contains(stderr, "errand: output truncated at 65536 bytes") {
+		t.Errorf("stderr=%q, want the truncation diagnostic", stderr)
+	}
+	if took > 4*time.Second {
+		t.Errorf("took %v, want a prompt teardown", took)
+	}
+}
+
+func TestIntegrationRunUnderTheCapIsUntouched(t *testing.T) {
+	s := sshtest.Start(t)
+	code, stdout, stderr := errand(t, trusting(t, s), "", "run", "h", "--max-output", "64KiB", "--", "echo hi; exit 3")
+	if code != 3 || stdout != "hi\n" || strings.Contains(stderr, "truncated") {
+		t.Errorf("code=%d stdout=%q stderr=%q, want 3, %q and no truncation", code, stdout, stderr, "hi\n")
+	}
+}
+
+// TestIntegrationRunCapStraddledByAnExit is SPEC 5.4's asymmetry with a
+// timeout: output that runs past the cap still exits with the remote's own
+// code when that code arrives inside killGrace.
+func TestIntegrationRunCapStraddledByAnExit(t *testing.T) {
+	s := sshtest.Start(t)
+	code, stdout, stderr := errand(t, trusting(t, s), "", "run", "h", "--max-output", "64KiB", "--", "head -c 200000 /dev/zero; exit 7")
+	t.Logf("exit %d with %d stdout bytes, stderr: %s", code, len(stdout), stderr)
+	if code != 7 {
+		t.Errorf("code=%d, want the remote's own 7", code)
+	}
+	if len(stdout) != 65536 {
+		t.Errorf("delivered %d stdout bytes, want exactly the 65536-byte cap", len(stdout))
+	}
+	if !strings.Contains(stderr, "truncated") {
+		t.Errorf("stderr=%q, want a truncation diagnostic", stderr)
+	}
+}
+
+func TestIntegrationRunCapDisabled(t *testing.T) {
+	s := sshtest.Start(t)
+	code, stdout, stderr := errand(t, trusting(t, s), "", "run", "h", "--max-output", "0", "--", "head -c 2000000 /dev/zero")
+	if code != 0 || len(stdout) != 2000000 {
+		t.Errorf("code=%d with %d stdout bytes, want 0 and 2000000; stderr=%q", code, len(stdout), stderr)
+	}
+}
+
+// TestIntegrationRunCapSpansBothStreams checks the budget is shared, not per
+// stream. Only the remote writes a "z", so errand's own diagnostic on stderr
+// cannot be mistaken for delivered stderr.
+func TestIntegrationRunCapSpansBothStreams(t *testing.T) {
+	s := sshtest.Start(t)
+	code, stdout, stderr := errand(t, trusting(t, s), "", "run", "h", "--max-output", "10", "--", "printf aaaaaa; printf zzzzzz >&2; sleep 5")
+	t.Logf("exit %d, stdout=%q stderr=%q", code, stdout, stderr)
+	delivered := len(stdout) + strings.Count(stderr, "z")
+	if code != 254 || delivered != 10 {
+		t.Errorf("code=%d with %d bytes delivered across both streams, want 254 and 10", code, delivered)
+	}
+	if !strings.Contains(stderr, "output truncated at 10 bytes") {
+		t.Errorf("stderr=%q, want the diagnostic to count both streams", stderr)
+	}
+}
+
+func TestIntegrationRunPerHostMaxOutput(t *testing.T) {
+	s := sshtest.Start(t)
+	cfg := writeConfig(t, s, hostConfig{knownHosts: s.KnownHostsLine() + "\n", maxOutput: "1KiB"})
+	// The trailing sleep keeps the remote alive past the breach, so the exit
+	// code says whether the cap fired rather than which of the two won a race.
+	const command = "head -c 5000 /dev/zero; sleep 1"
+	if code, _, stderr := errand(t, cfg, "", "run", "h", "--", command); code != 254 {
+		t.Errorf("per-host max_output: code=%d, want 254; stderr=%q", code, stderr)
+	}
+	code, stdout, stderr := errand(t, cfg, "", "run", "h", "--max-output", "1MiB", "--", command)
+	if code != 0 || len(stdout) != 5000 {
+		t.Errorf("flag overriding max_output: code=%d with %d stdout bytes, want 0 and 5000; stderr=%q", code, len(stdout), stderr)
 	}
 }
