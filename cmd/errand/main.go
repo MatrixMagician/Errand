@@ -2,6 +2,8 @@
 package main
 
 import (
+	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -9,15 +11,16 @@ import (
 	"runtime/debug"
 	"strings"
 	"text/tabwriter"
+	"time"
 
+	"github.com/MatrixMagician/Errand/internal/client"
 	"github.com/MatrixMagician/Errand/internal/config"
+	"github.com/MatrixMagician/Errand/internal/exec"
+	"github.com/MatrixMagician/Errand/internal/result"
 )
 
 // version is overridden at build time: -ldflags "-X main.version=v1.2.3".
 var version = "dev"
-
-// Exit codes reserved for client-side failures (SPEC §5.2).
-const exitUsage = 250
 
 const usage = `usage:
   errand run   <host> [flags] -- <command...>   execute a command
@@ -26,6 +29,9 @@ const usage = `usage:
   errand check <host> [flags]                   preflight: resolve, connect, authenticate
   errand hosts                                  list declared hosts and resolved parameters
   errand version                                print the version
+
+flags for run:
+  --stdin                                       stream local stdin to the remote command
 
 <host> is an alias declared in the config file (default ~/.config/errand/config.toml,
 overridable with ERRAND_CONFIG). Exit 250 on usage or configuration errors.
@@ -38,9 +44,9 @@ func main() {
 // run dispatches args and returns the process exit code. Errand's own
 // diagnostics go to stderr prefixed "errand: " (SPEC §5.1).
 func run(args []string, stdout, stderr io.Writer) int {
+	diag := diagnostics(stderr)
 	if len(args) == 0 {
-		fmt.Fprint(stderr, "errand: missing subcommand\n"+usage)
-		return exitUsage
+		return failUsage(stderr, diag, errors.New("missing subcommand"))
 	}
 	sub, rest := args[0], args[1:]
 	switch sub {
@@ -50,50 +56,107 @@ func run(args []string, stdout, stderr io.Writer) int {
 	case "version":
 		fmt.Fprintf(stdout, "errand %s\n", buildVersion())
 		return 0
+	case "hosts", "run", "put", "get", "check":
+	default:
+		return failUsage(stderr, diag, fmt.Errorf("unknown subcommand %q", sub))
 	}
 
 	fs := flag.NewFlagSet("errand "+sub, flag.ContinueOnError)
 	fs.SetOutput(io.Discard) // we print errors ourselves with the errand: prefix
 	fs.Usage = func() {}     // printed by us: on -h below, never on a parse error
-	switch sub {
-	case "hosts", "run", "put", "get", "check":
-	default:
-		fmt.Fprintf(stderr, "errand: unknown subcommand %q\n%s", sub, usage)
-		return exitUsage
+	var stdin bool
+	if sub == "run" {
+		fs.BoolVar(&stdin, "stdin", false, "stream local stdin to the remote command")
 	}
 	if err := fs.Parse(rest); err != nil {
-		if err == flag.ErrHelp {
+		if errors.Is(err, flag.ErrHelp) {
 			fmt.Fprint(stdout, usage)
 			return 0
 		}
-		fmt.Fprintf(stderr, "errand: %s: %v\n", sub, err)
-		return exitUsage
+		return fail(diag, result.Usage, "", fmt.Errorf("%s: %v", sub, err))
 	}
 
 	cfg, err := config.Load(config.DefaultPath())
 	if err != nil {
-		fmt.Fprintf(stderr, "errand: %v\n", err)
-		return exitUsage
+		return fail(diag, result.Resolve, "", err)
 	}
 	if sub == "hosts" {
-		return hosts(cfg, stdout)
+		return hosts(cfg, stdout, diag)
 	}
 
-	// run/put/get/check: resolve the alias now so the allowlist is enforced
-	// even before the implementation lands (M2/M4).
 	if fs.NArg() == 0 {
-		fmt.Fprintf(stderr, "errand: %s: missing <host>\n", sub)
-		return exitUsage
+		return fail(diag, result.Usage, "", fmt.Errorf("%s: missing <host>", sub))
 	}
-	if _, err := cfg.Resolve(fs.Arg(0)); err != nil {
-		fmt.Fprintf(stderr, "errand: %v\n", err)
-		return exitUsage
+	alias := fs.Arg(0)
+	// Flags are also accepted after the host, so parse what follows it.
+	if err := fs.Parse(fs.Args()[1:]); err != nil {
+		return fail(diag, result.Usage, "", fmt.Errorf("%s: %v", sub, err))
 	}
-	fmt.Fprintf(stderr, "errand: %s: not implemented\n", sub)
-	return exitUsage
+	h, err := cfg.Resolve(alias)
+	if err != nil {
+		return fail(diag, result.Resolve, alias, err)
+	}
+	if sub != "run" {
+		return fail(diag, result.Usage, "", fmt.Errorf("%s: not implemented", sub))
+	}
+
+	command := strings.Join(fs.Args(), " ")
+	if command == "" {
+		return fail(diag, result.Usage, "", errors.New("run: missing <command>"))
+	}
+	var in io.Reader
+	if stdin {
+		in = os.Stdin
+	}
+	res := attempt(context.Background(), h, diag, func(ctx context.Context, c *client.Conn) result.Result {
+		return exec.Run(ctx, c, exec.Request{Command: command, Stdin: in, Stdout: stdout, Stderr: stderr})
+	})
+	res.Op = "run"
+	return finish(res, diag)
 }
 
-func hosts(cfg *config.File, stdout io.Writer) int {
+// attempt connects, runs body, and fills in what only the caller knows.
+func attempt(ctx context.Context, h config.Host, diag client.Diag, body func(context.Context, *client.Conn) result.Result) result.Result {
+	start := time.Now()
+	target := fmt.Sprintf("%s@%s:%d", h.User, h.Hostname, h.Port)
+	conn, err := client.Dial(ctx, h, diag)
+	if err != nil {
+		return result.Result{Host: h.Alias, Target: target, Err: err, Elapsed: time.Since(start)}
+	}
+	defer func() { _ = conn.Close() }()
+
+	res := body(ctx, conn)
+	res.Host, res.Target = h.Alias, target
+	res.Connect, res.Elapsed = conn.Connect, time.Since(start)
+	return res
+}
+
+// finish is the single exit path: every outcome, including the ones that never
+// reached a connection, is reported and scored here.
+func finish(res result.Result, diag client.Diag) int {
+	if d := res.Diagnostic(); d != "" {
+		diag("%s", d)
+	}
+	return res.ExitCode()
+}
+
+func fail(diag client.Diag, phase result.Phase, host string, err error) int {
+	return finish(result.Result{Host: host, Err: phase.Wrap(host, err)}, diag)
+}
+
+func failUsage(stderr io.Writer, diag client.Diag, err error) int {
+	code := fail(diag, result.Usage, "", err)
+	fmt.Fprint(stderr, usage)
+	return code
+}
+
+func diagnostics(w io.Writer) client.Diag {
+	return func(format string, args ...any) {
+		fmt.Fprintf(w, "errand: "+format+"\n", args...)
+	}
+}
+
+func hosts(cfg *config.File, stdout io.Writer, diag client.Diag) int {
 	tw := tabwriter.NewWriter(stdout, 0, 0, 2, ' ', 0)
 	fmt.Fprintln(tw, "ALIAS\tHOSTNAME\tPORT\tUSER\tTIMEOUT\tMAX_OUTPUT\tACCEPT_NEW\tHOST_KEY")
 	for _, alias := range cfg.Aliases() {
@@ -102,7 +165,7 @@ func hosts(cfg *config.File, stdout io.Writer) int {
 			h.Alias, h.Hostname, h.Port, h.User, h.Timeout, h.MaxOutput, yesNo(h.AcceptNew), pinned(h.HostKey))
 	}
 	if err := tw.Flush(); err != nil {
-		return exitUsage
+		return fail(diag, result.Usage, "", err)
 	}
 	return 0
 }
