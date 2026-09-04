@@ -16,11 +16,11 @@ func TestCounterIsExact(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if want := int64(sink.Len()); c.n != want {
-		t.Errorf("counted %d bytes, wrote %d", c.n, want)
+	if want := int64(sink.Len()); c.n.Load() != want {
+		t.Errorf("counted %d bytes, wrote %d", c.n.Load(), want)
 	}
-	if c.n != 5007 {
-		t.Errorf("counted %d, want 5007", c.n)
+	if c.n.Load() != 5007 {
+		t.Errorf("counted %d, want 5007", c.n.Load())
 	}
 }
 
