@@ -28,18 +28,20 @@ const usage = `usage:
   errand run   <host> [flags] -- <command...>   execute a command
   errand put   <host> [flags] <local> <remote>  upload a file (SFTP)
   errand get   <host> [flags] <remote> <local>  download a file (SFTP)
-  errand check <host> [flags]                   preflight: resolve, connect, authenticate
+  errand check <host> [flags]                   preflight: connect, authenticate, run 'true'
   errand hosts                                  list declared hosts and resolved parameters
   errand version                                print the version
 
-flags for run:
-  --stdin                                       stream local stdin to the remote command
+flags for run and check:
   --timeout <dur>                               wall-clock limit for the whole invocation
   --connect-timeout <dur>                       limit for TCP, handshake and auth, within --timeout
+  --quiet                                       suppress errand's own diagnostics, never the remote's
+
+flags for run only:
+  --stdin                                       stream local stdin to the remote command
   --max-output <bytes>                          combined cap across stdout and stderr; 0 disables
   --env KEY=VAL                                 set a remote environment variable; repeatable
   --pty                                         request a PTY for tools that refuse to run without one
-  --quiet                                       suppress errand's own diagnostics, never the remote's
 
 <host> is an alias declared in the config file (default ~/.config/errand/config.toml,
 overridable with ERRAND_CONFIG). Exit 250 on usage or configuration errors.
@@ -104,33 +106,48 @@ func run(args []string, stdout, stderr io.Writer) int {
 	if err != nil {
 		return fail(diag, result.Resolve, alias, err)
 	}
-	if sub != "run" {
+	if sub != "run" && sub != "check" {
 		return fail(diag, result.Usage, "", fmt.Errorf("%s: not implemented", sub))
 	}
 
-	command := strings.Join(fs.Args(), " ")
-	if command == "" {
-		return fail(diag, result.Usage, "", errors.New("run: missing <command>"))
-	}
-	var in io.Reader
-	if o.stdin {
-		in = os.Stdin
+	var req exec.Request
+	if sub == "run" {
+		command := strings.Join(fs.Args(), " ")
+		if command == "" {
+			return fail(diag, result.Usage, "", errors.New("run: missing <command>"))
+		}
+		if !given(fs, "max-output") {
+			o.maxOutput = int64(h.MaxOutput)
+		}
+		var in io.Reader
+		if o.stdin {
+			in = os.Stdin
+		}
+		req = exec.Request{
+			Command: command, Stdin: in, Stdout: stdout, Stderr: stderr,
+			MaxOutput: o.maxOutput, Env: o.env, PTY: o.pty,
+		}
+	} else {
+		if fs.NArg() > 0 {
+			return fail(diag, result.Usage, "", fmt.Errorf("check: takes no command, got %q", fs.Arg(0)))
+		}
+		// check is run with the question narrowed to the connection: a command
+		// every host has, and both streams discarded, so the only thing the
+		// caller learns is whether errand could get there and back.
+		req = exec.Request{Command: "true", Stdout: io.Discard, Stderr: io.Discard}
 	}
 	if !given(fs, "timeout") {
 		o.timeout = h.Timeout
 	}
-	if !given(fs, "max-output") {
-		o.maxOutput = int64(h.MaxOutput)
-	}
 	ctx, stop := interruptible(context.Background())
 	defer stop()
 	res := attempt(ctx, h, o.timeout, o.connectTimeout, diag, func(ctx context.Context, c *client.Conn) result.Result {
-		return exec.Run(ctx, c, exec.Request{
-			Command: command, Stdin: in, Stdout: stdout, Stderr: stderr,
-			MaxOutput: o.maxOutput, Env: o.env, PTY: o.pty,
-		})
+		return exec.Run(ctx, c, req)
 	})
-	res.Op = "run"
+	res.Op = sub
+	if sub == "check" && res.ExitCode() == 0 {
+		diag("ok %s connect=%dms", res.Target, res.Connect.Milliseconds())
+	}
 	return finish(res, diag)
 }
 

@@ -741,6 +741,13 @@ func TestIntegrationCheckSucceeds(t *testing.T) {
 	if !want.MatchString(stderr) {
 		t.Errorf("stderr=%q, want a line matching %v", stderr, want)
 	}
+
+	// The summary is a diagnostic, so --quiet takes it away without changing
+	// the answer the exit code carries.
+	code, _, stderr = errand(t, trusting(t, s), "", "check", "h", "--quiet")
+	if code != 0 || stderr != "" {
+		t.Errorf("--quiet: code=%d stderr=%q, want 0 and silence", code, stderr)
+	}
 }
 
 // TestIntegrationCheckFailsLikeRun is the ticket's promise: a 251 or 252 from
