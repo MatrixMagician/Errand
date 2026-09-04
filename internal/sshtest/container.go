@@ -35,6 +35,10 @@ PermitRootLogin yes
 AcceptEnv FOO
 StrictModes no
 LogLevel INFO
+# Every test dials from the same address and the suite fails authentication on
+# purpose, so OpenSSH 9.8's default per-source penalties would eventually drop
+# every connection and fail the tests that come last.
+PerSourcePenalties no
 `
 
 var errNoRuntime = errors.New("no container runtime (docker/podman) found")
