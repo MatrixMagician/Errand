@@ -330,3 +330,31 @@ errand run web-prod -- 'tar -C /var/log/nginx -czf - .' > nginx-logs.tgz
 `--max-output` caps the sum of stdout and stderr bytes. Everything up to the cap is delivered. On breach `errand` stops reading, tears the session down as for a timeout, and prints `errand: output truncated at 1048576 bytes`. If the remote's exit status arrived in the moment before teardown, `errand` exits with it. Otherwise it exits 254. With `--json`, `status` is `truncated` and `truncated` is `true` in both cases. The default of 1 MiB protects an agent's context window. Raise it deliberately when you mean to read more.
 
 While a command runs, `errand` sends TCP and SSH keepalives every 30 seconds so long commands survive stateful firewalls.
+
+## Claude Code
+
+`contrib/claude-code` holds three files. Installed, they make Claude Code reach for Errand whenever a remote host comes up, run a listed command without a permission prompt, and prompt for everything else.
+
+- `errand-allow-hook.py` is a PreToolUse hook on the Bash tool. When the Bash command is one plain `errand` invocation, the hook runs `errand allow` with the same arguments and, on exit 0, tells Claude Code to run it without asking. For any other outcome it prints nothing, and Claude Code prompts as it normally would. The hook never denies and never asks. It needs `python3` and `errand` on `PATH`, and Claude Code runs hooks with the `PATH` of your login shell rather than the terminal's, so install `errand` somewhere standard such as `~/.local/bin`. A hook that cannot find `errand` stays silent, and every command prompts.
+- `skills/errand/SKILL.md` is a skill that fires when SSH, a server, or a remote host comes up. It tells Claude to run `errand hosts` first, write `--` before the command, pass the command as one single-quoted argument, use `--json`, read `status` before `exit_code`, and reach for `errand get` rather than `cat` on a large file. It says nothing about setup; declaring hosts and managing keys stay yours.
+- `settings.json` registers the hook and denies `ssh`, `scp`, `sftp`, and `rsync`, so Errand is the only road out.
+
+Install:
+
+```sh
+cp contrib/claude-code/errand-allow-hook.py ~/.claude/hooks/
+cp -r contrib/claude-code/skills/errand ~/.claude/skills/
+cp contrib/claude-code/settings.json ~/.claude/settings.json
+```
+
+If you already have a `~/.claude/settings.json`, add the `permissions.deny` entries and the `PreToolUse` entry from the snippet to it instead of copying over it.
+
+The hook decides from the command string alone and declines anything Bash would treat as more than one simple command. `cd x && errand ...`, `errand ... | jq`, an unquoted `$`, a glob, a redirection, or a comment each make it stay silent, and you get the prompt. A remote command written as one single-quoted argument is forwarded whole, so `errand run lab -- 'ps aux | grep nginx'` is judged by `errand allow` on the pipeline inside the quotes.
+
+**Other Bash hooks.** Claude Code runs every matching PreToolUse hook at the same time, so their order in the settings file does not matter, and a hook that rewrites the command has its rewrite applied to what runs, and to what the permission rules see, even when this hook approved the original string. The `rtk` hook does two things that matter here. It rewrites an unquoted pipeline, turning `errand run lab -- cat /etc/hosts | grep x` into `... | rtk grep x`, which fails on the remote; it leaves a single-quoted remote command alone, which is why the skill tells Claude to single-quote it. And it rewrites `ssh ...` into `rtk ssh ...`, so the deny rule `Bash(ssh *)` no longer matches and `ssh` runs. On a machine with `rtk`, add the rewritten forms to the deny list as well:
+
+```json
+"deny": ["Bash(ssh *)", "Bash(rtk ssh *)", "Bash(scp *)", "Bash(rtk scp *)", "Bash(sftp *)", "Bash(rtk sftp *)", "Bash(rsync *)", "Bash(rtk rsync *)"]
+```
+
+Any other rewriting hook needs the same treatment: whatever it turns `ssh` into is what the deny rule has to name.
