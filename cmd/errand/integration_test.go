@@ -82,13 +82,8 @@ func TestIntegrationHosts(t *testing.T) {
 func TestIntegrationRunStreamsUnmerged(t *testing.T) {
 	s := sshtest.Start(t)
 	code, stdout, stderr := errand(t, trusting(t, s), "", "run", "h", "--", "echo out; echo err >&2")
-	// The harness runs sshd with -e and LogLevel DEBUG, so its own log lines
-	// share the session's stderr; assert on errand's contribution to it.
-	if code != 0 || stdout != "out\n" {
+	if code != 0 || stdout != "out\n" || stderr != "err\n" {
 		t.Errorf("code=%d stdout=%q stderr=%q", code, stdout, stderr)
-	}
-	if !strings.Contains(stderr, "err\n") || strings.Contains(stderr, "errand: ") {
-		t.Errorf("stderr should carry the remote's line and no diagnostics: %q", stderr)
 	}
 }
 

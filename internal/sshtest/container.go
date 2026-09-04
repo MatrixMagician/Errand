@@ -34,7 +34,7 @@ PubkeyAuthentication yes
 PermitRootLogin yes
 AcceptEnv FOO
 StrictModes no
-LogLevel DEBUG
+LogLevel INFO
 `
 
 var errNoRuntime = errors.New("no container runtime (docker/podman) found")
