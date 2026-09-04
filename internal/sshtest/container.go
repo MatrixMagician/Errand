@@ -33,6 +33,7 @@ KbdInteractiveAuthentication no
 PubkeyAuthentication yes
 PermitRootLogin yes
 AcceptEnv FOO
+Subsystem sftp /usr/lib/ssh/sftp-server
 StrictModes no
 LogLevel INFO
 # Every test dials from the same address and the suite fails authentication on
