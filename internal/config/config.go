@@ -31,6 +31,16 @@ func DefaultPath() string {
 	return ExpandHome("~/.config/errand/config.toml")
 }
 
+// DefaultAuditLog returns $XDG_STATE_HOME/errand/audit.jsonl, or
+// ~/.local/state/errand/audit.jsonl. It is where runs are recorded when
+// [defaults] declares no audit_log (SPEC §10).
+func DefaultAuditLog() string {
+	if d := os.Getenv("XDG_STATE_HOME"); d != "" {
+		return filepath.Join(d, "errand", "audit.jsonl")
+	}
+	return ExpandHome("~/.local/state/errand/audit.jsonl")
+}
+
 // ExpandHome replaces a leading "~" or "~/" with $HOME. "~user" forms are left alone.
 func ExpandHome(p string) string {
 	if p == "~" || strings.HasPrefix(p, "~/") {
