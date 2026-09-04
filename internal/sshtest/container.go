@@ -69,8 +69,14 @@ func startServer() (*Server, error) {
 	if rt == "" {
 		return nil, errNoRuntime
 	}
-	dir, err := sharedDir()
+	root, err := sharedDir()
 	if err != nil {
+		return nil, err
+	}
+	// The container mount holds only what sshd reads; the built binary stays
+	// in the parent, out of reach of the :Z relabelling below.
+	dir := filepath.Join(root, "server")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, err
 	}
 	s := &Server{Dir: dir, runtime: rt, name: fmt.Sprintf("errand-sshtest-%d", os.Getpid())}
