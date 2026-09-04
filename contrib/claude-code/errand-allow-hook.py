@@ -73,6 +73,15 @@ def simple_command(command: str) -> list[str] | None:
     return words or None
 
 
+def is_the_errand_on_path(word: str, errand: str) -> bool:
+    """A bare `errand` resolves to the same binary the verdict comes from. A path
+    is accepted only when it is that binary: judging one program's arguments
+    and then running another would approve whatever wears the name."""
+    if word == "errand":
+        return True
+    return os.sep in word and os.path.realpath(word) == os.path.realpath(errand)
+
+
 def main() -> int:
     try:
         event = json.load(sys.stdin)
@@ -88,10 +97,10 @@ def main() -> int:
         return 0
 
     words = simple_command(command)
-    if words is None or os.path.basename(words[0]) != "errand":
+    if words is None:
         return 0
     errand = shutil.which("errand")
-    if errand is None:
+    if errand is None or not is_the_errand_on_path(words[0], errand):
         return 0
     try:
         done = subprocess.run(
