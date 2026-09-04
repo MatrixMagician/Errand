@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -32,7 +33,7 @@ func TestResolvePrecedence(t *testing.T) {
 	}
 	want := Host{
 		Alias: "web-prod", Hostname: "web1.example.net", Port: 2222, User: "deploy",
-		Timeout: 60 * time.Second, MaxOutput: 1 << 20,
+		Timeout: 60 * time.Second, MaxOutput: 1 << 20, AllowCommands: []string{"uptime"},
 		KnownHosts: []string{"/home/tester/.ssh/known_hosts"}, IdentityFiles: []string{"/home/tester/.ssh/id_ed25519"},
 	}
 	if !reflect.DeepEqual(h, want) {
@@ -47,6 +48,9 @@ func TestResolvePrecedence(t *testing.T) {
 	if h.Port != 22 || h.User != "oliverh" || h.Timeout != 120*time.Second || h.MaxOutput != 256<<10 || !h.AcceptNew {
 		t.Errorf("lab: %+v", h)
 	}
+	if want := []string{"df", "uptime"}; !slices.Equal(h.AllowCommands, want) {
+		t.Errorf("lab allow_commands = %q, want %q", h.AllowCommands, want)
+	}
 
 	// pinned key passes through untouched
 	h, err = cfg.Resolve("db-restore")
@@ -55,6 +59,34 @@ func TestResolvePrecedence(t *testing.T) {
 	}
 	if !strings.HasPrefix(h.HostKey, "ssh-ed25519 ") {
 		t.Errorf("db-restore host_key = %q", h.HostKey)
+	}
+}
+
+// TestAllowCommandsExplicitEmptyListReplacesTheDefaults separates the two ways
+// a Host ends up allowing nothing: a list written as [], and no list at all.
+func TestAllowCommandsExplicitEmptyListReplacesTheDefaults(t *testing.T) {
+	cfg, err := Load(write(t, "[defaults]\nallow_commands = [\"df\"]\n[hosts.a]\nhostname = \"a\"\nallow_commands = []\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	h, err := cfg.Resolve("a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(h.AllowCommands) != 0 {
+		t.Errorf("[] resolved to %q, want nothing", h.AllowCommands)
+	}
+
+	cfg, err = Load(write(t, "[hosts.a]\nhostname = \"a\"\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	h, err = cfg.Resolve("a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(h.AllowCommands) != 0 {
+		t.Errorf("no list anywhere resolved to %q, want nothing", h.AllowCommands)
 	}
 }
 
@@ -94,12 +126,13 @@ func TestMalformedTOMLReportsPosition(t *testing.T) {
 
 func TestRejects(t *testing.T) {
 	cases := map[string]string{
-		"via reserved":     "[hosts.a]\nhostname = \"a\"\nvia = \"bastion\"\n",
-		"unknown key":      "[hosts.a]\nhostname = \"a\"\nacept_new = true\n",
-		"missing hostname": "[hosts.a]\nport = 22\n",
-		"bad port":         "[hosts.a]\nhostname = \"a\"\nport = 70000\n",
-		"bad duration":     "[hosts.a]\nhostname = \"a\"\ntimeout = \"soon\"\n",
-		"bad size":         "[hosts.a]\nhostname = \"a\"\nmax_output = \"1GB\"\n",
+		"via reserved":       "[hosts.a]\nhostname = \"a\"\nvia = \"bastion\"\n",
+		"unknown key":        "[hosts.a]\nhostname = \"a\"\nacept_new = true\n",
+		"missing hostname":   "[hosts.a]\nport = 22\n",
+		"bad port":           "[hosts.a]\nhostname = \"a\"\nport = 70000\n",
+		"bad duration":       "[hosts.a]\nhostname = \"a\"\ntimeout = \"soon\"\n",
+		"bad size":           "[hosts.a]\nhostname = \"a\"\nmax_output = \"1GB\"\n",
+		"bad allow_commands": "[hosts.a]\nhostname = \"a\"\nallow_commands = \"df\"\n",
 	}
 	for name, body := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -112,6 +145,9 @@ func TestRejects(t *testing.T) {
 	}
 	if _, err := Load(write(t, "[hosts.a]\nhostname = \"a\"\nvia = \"b\"\n")); err == nil || !strings.Contains(err.Error(), "not supported in v1") {
 		t.Errorf("via message: %v", err)
+	}
+	if _, err := Load(write(t, "[hosts.a]\nhostname = \"a\"\nallow_commands = \"df\"\n")); err == nil || !strings.Contains(err.Error(), "allow_commands") {
+		t.Errorf("allow_commands message: %v", err)
 	}
 }
 

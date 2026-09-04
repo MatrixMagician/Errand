@@ -135,17 +135,19 @@ type defaults struct {
 	KnownHosts    paths     `toml:"known_hosts"`
 	IdentityFiles paths     `toml:"identity_files"`
 	AuditLog      string    `toml:"audit_log"`
+	AllowCommands []string  `toml:"allow_commands"`
 }
 
 type stanza struct {
-	Hostname  string    `toml:"hostname"`
-	Port      int       `toml:"port"`
-	User      string    `toml:"user"`
-	Timeout   *Duration `toml:"timeout"`
-	MaxOutput *Size     `toml:"max_output"`
-	AcceptNew bool      `toml:"accept_new"`
-	HostKey   string    `toml:"host_key"`
-	Via       string    `toml:"via"` // reserved for bastion hops (SPEC §11); rejected in v1
+	Hostname      string    `toml:"hostname"`
+	Port          int       `toml:"port"`
+	User          string    `toml:"user"`
+	Timeout       *Duration `toml:"timeout"`
+	MaxOutput     *Size     `toml:"max_output"`
+	AcceptNew     bool      `toml:"accept_new"`
+	HostKey       string    `toml:"host_key"`
+	AllowCommands []string  `toml:"allow_commands"`
+	Via           string    `toml:"via"` // reserved for bastion hops (SPEC §11); rejected in v1
 }
 
 // File is a parsed and validated configuration.
@@ -163,6 +165,7 @@ type Host struct {
 	User          string
 	Timeout       time.Duration
 	MaxOutput     Size
+	AllowCommands []string // Command allowlist (ADR-0003); a host's list replaces the defaults', so [] allows nothing
 	AcceptNew     bool
 	HostKey       string // pinned public key in authorized_keys format; empty means use KnownHosts
 	KnownHosts    []string
@@ -222,7 +225,7 @@ func (f *File) Resolve(alias string) (Host, error) {
 		Timeout: DefaultTimeout, MaxOutput: DefaultMaxOutput,
 		AcceptNew: s.AcceptNew, HostKey: s.HostKey,
 		KnownHosts: expandAll(d.KnownHosts), IdentityFiles: expandAll(d.IdentityFiles),
-		AuditLog: ExpandHome(d.AuditLog),
+		AuditLog: ExpandHome(d.AuditLog), AllowCommands: d.AllowCommands,
 	}
 	if h.Port == 0 {
 		h.Port = DefaultPort
@@ -238,6 +241,9 @@ func (f *File) Resolve(alias string) (Host, error) {
 	}
 	if m := firstSet(s.MaxOutput, d.MaxOutput); m != nil {
 		h.MaxOutput = *m
+	}
+	if s.AllowCommands != nil {
+		h.AllowCommands = s.AllowCommands
 	}
 	return h, nil
 }
