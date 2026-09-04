@@ -63,7 +63,21 @@ errand version
 
 `<host>` is always an alias from the config file, never `user@hostname`. Flags go before or after the alias, but before the command or the paths. `errand --help` and `errand <subcommand> --help` print the same usage text as this section.
 
-`errand allow` takes the tail of any `errand` invocation and answers whether a harness may run it without asking a human: exit 0 and nothing on stdout when the command is on the host's `allow_commands` list, exit 1 and a one-line reason on stdout when it is not, exit 250 for the usage and configuration errors the judged subcommand would raise. `hosts`, `version`, `check`, and `get` always pass; `put` never does; `run` is judged by the first word of its command. `run`, `put`, and `get` never consult the list themselves (ADR-0003).
+`errand allow` takes the tail of any `errand` invocation and answers whether a harness may run it without asking a human: exit 0 and nothing on stdout when the command is on the host's `allow_commands` list, exit 1 and a one-line reason on stdout when it is not, exit 250 for the usage and configuration errors the judged subcommand would raise. `hosts`, `version`, `help`, `check`, and `get` always pass; `put` never does; `run` is judged by its command. `run`, `put`, and `get` never consult the list themselves (ADR-0003).
+
+```sh
+# harness
+errand allow run web-prod -- uptime
+errand allow run web-prod -- 'df -h | head -n 2'  # exit 1
+errand allow run web-prod -- systemctl status nginx
+errand allow run web-prod -- systemctl restart nginx  # exit 1
+errand allow run web-prod -- 'ls / > /tmp/listing'  # exit 1
+errand allow run web-prod -- sudo df -h  # exit 1
+errand allow put web-prod restart.sh /tmp/restart.sh  # exit 1
+errand allow check web-prod
+```
+
+The list behind those lines is `["uname", "ls", "df", "uptime", "systemctl status"]`, so the failing lines print, in order, `not on allowlist: head` because a pipeline passes only when every segment is listed, then `not on allowlist: systemctl restart`, `redirection`, `sudo`, and `put`.
 
 ### Write `--` before the command
 
