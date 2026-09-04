@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"flag"
+	"io"
 	"os"
 	"slices"
 	"strings"
@@ -54,8 +55,14 @@ func TestExit250(t *testing.T) {
 		"run missing host":     {"run"},
 		"run missing command":  {"run", "web-prod"},
 		"unparseable size":     {"run", "web-prod", "--max-output", "1GB", "--", "true"},
-		"put not implemented":  {"put", "web-prod", "a", "b"},
 		"get not implemented":  {"get", "web-prod", "a", "b"},
+		"put missing paths":    {"put", "web-prod"},
+		"put missing remote":   {"put", "web-prod", "a"},
+		"put extra path":       {"put", "web-prod", "a", "b", "c"},
+		"put takes no stdin":   {"put", "web-prod", "--stdin", "a", "b"},
+		"put takes no cap":     {"put", "web-prod", "--max-output", "1KiB", "a", "b"},
+		"put unparseable size": {"put", "web-prod", "--max-size", "1GB", "a", "b"},
+		"put unparseable mode": {"put", "web-prod", "--mode", "rwx", "a", "b"},
 		"check takes no stdin": {"check", "web-prod", "--stdin"},
 		"check takes no env":   {"check", "web-prod", "--env", "A=b"},
 		"check takes no pty":   {"check", "web-prod", "--pty"},
@@ -173,13 +180,16 @@ func TestQuietSilencesOnlyErrandsOwnDiagnostics(t *testing.T) {
 	}
 }
 
-// TestCheckDeclaresTheSharedFlags pins the split registerFlags makes: the three
-// flags that bound a connection are check's too, the ones that shape a command
-// are not.
-func TestCheckDeclaresTheSharedFlags(t *testing.T) {
+// TestSubcommandsDeclareTheirFlags pins the split registerFlags makes: the four
+// flags that bound a connection belong to every subcommand that opens one, and
+// the ones that shape a command or a transfer belong to just the one.
+func TestSubcommandsDeclareTheirFlags(t *testing.T) {
 	shared := []string{"timeout", "connect-timeout", "quiet", "json"}
-	runOnly := []string{"stdin", "pty", "env", "max-output"}
-	for _, sub := range []string{"run", "check"} {
+	only := map[string][]string{
+		"run": {"stdin", "pty", "env", "max-output"},
+		"put": {"mode", "max-size"},
+	}
+	for _, sub := range []string{"run", "put", "check"} {
 		fs := flag.NewFlagSet(sub, flag.ContinueOnError)
 		registerFlags(fs, sub)
 		for _, name := range shared {
@@ -187,9 +197,11 @@ func TestCheckDeclaresTheSharedFlags(t *testing.T) {
 				t.Errorf("%s does not declare --%s", sub, name)
 			}
 		}
-		for _, name := range runOnly {
-			if got, want := fs.Lookup(name) != nil, sub == "run"; got != want {
-				t.Errorf("%s declares --%s: %v, want %v", sub, name, got, want)
+		for owner, names := range only {
+			for _, name := range names {
+				if got, want := fs.Lookup(name) != nil, sub == owner; got != want {
+					t.Errorf("%s declares --%s: %v, want %v", sub, name, got, want)
+				}
 			}
 		}
 	}
@@ -243,5 +255,46 @@ func TestWithoutJSONNothingIsWrittenToStdout(t *testing.T) {
 	code, stdout, _ := runCLI(t, "run", "ghost", "--", "true")
 	if code != 250 || stdout != "" {
 		t.Errorf("code=%d stdout=%q, want 250 and nothing on stdout", code, stdout)
+	}
+}
+
+func TestPutModeIsParsedAsOctal(t *testing.T) {
+	for _, tc := range []struct {
+		arg  string
+		want os.FileMode
+		bad  bool
+	}{
+		{arg: "", want: 0o644},
+		{arg: "0755", want: 0o755},
+		{arg: "755", want: 0o755},
+		{arg: "600", want: 0o600},
+		{arg: "0999", bad: true},
+		{arg: "rwx", bad: true},
+		{arg: "-1", bad: true},
+	} {
+		fs := flag.NewFlagSet("put", flag.ContinueOnError)
+		fs.SetOutput(io.Discard)
+		o := registerFlags(fs, "put")
+		var args []string
+		if tc.arg != "" {
+			args = []string{"--mode", tc.arg}
+		}
+		err := fs.Parse(args)
+		switch {
+		case tc.bad && err == nil:
+			t.Errorf("--mode %q parsed to %04o, want a usage error", tc.arg, o.mode)
+		case !tc.bad && err != nil:
+			t.Errorf("--mode %q: %v", tc.arg, err)
+		case !tc.bad && o.mode != tc.want:
+			t.Errorf("--mode %q = %04o, want %04o", tc.arg, o.mode, tc.want)
+		}
+	}
+}
+
+func TestPutMaxSizeDefaultsTo64MiB(t *testing.T) {
+	fs := flag.NewFlagSet("put", flag.ContinueOnError)
+	o := registerFlags(fs, "put")
+	if err := fs.Parse(nil); err != nil || o.maxSize != 64<<20 {
+		t.Errorf("maxSize=%d err=%v, want %d", o.maxSize, err, 64<<20)
 	}
 }
