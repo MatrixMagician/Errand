@@ -2,6 +2,7 @@ package main
 
 import (
 	"crypto/ed25519"
+	"encoding/json"
 	"encoding/pem"
 	"fmt"
 	"io"
@@ -414,7 +415,7 @@ func timed(t *testing.T, cfg string, args ...string) (int, string, time.Duration
 // startErrand launches the binary and returns once the remote command has
 // announced itself on stdout, so a test can act while it is genuinely running.
 // The command must begin with "echo started".
-func startErrand(t *testing.T, cfg string, args ...string) (*exec.Cmd, *strings.Builder) {
+func startErrand(t *testing.T, cfg string, args ...string) (*exec.Cmd, io.Reader, *strings.Builder) {
 	t.Helper()
 	cmd := exec.Command(sshtest.Binary(t), args...)
 	cmd.Env = append(os.Environ(), "ERRAND_CONFIG="+cfg, "SSH_AUTH_SOCK=")
@@ -430,7 +431,7 @@ func startErrand(t *testing.T, cfg string, args ...string) (*exec.Cmd, *strings.
 	if _, err := io.ReadFull(stdout, make([]byte, len("started\n"))); err != nil {
 		t.Fatalf("waiting for the remote command to start: %v; stderr: %s", err, stderr)
 	}
-	return cmd, stderr
+	return cmd, stdout, stderr
 }
 
 func TestIntegrationRunTimeout(t *testing.T) {
@@ -459,7 +460,7 @@ func TestIntegrationRunTimeoutTeardownIsPrompt(t *testing.T) {
 		knownHosts: fmt.Sprintf("[127.0.0.1]:%d %s\n", p.Port, strings.TrimSpace(string(ssh.MarshalAuthorizedKey(s.HostKey)))),
 		port:       p.Port,
 	})
-	cmd, stderr := startErrand(t, cfg, "run", "h", "--timeout", "2s", "--", "echo started; sleep 30")
+	cmd, _, stderr := startErrand(t, cfg, "run", "h", "--timeout", "2s", "--", "echo started; sleep 30")
 	p.Freeze()
 	start := time.Now()
 	err := cmd.Wait()
@@ -493,7 +494,7 @@ func TestIntegrationRunConnectTimeout(t *testing.T) {
 
 func TestIntegrationRunCancelledBySIGINT(t *testing.T) {
 	s := sshtest.Start(t)
-	cmd, stderr := startErrand(t, trusting(t, s), "run", "h", "--", "echo started; sleep 30")
+	cmd, _, stderr := startErrand(t, trusting(t, s), "run", "h", "--", "echo started; sleep 30")
 	start := time.Now()
 	if err := cmd.Process.Signal(syscall.SIGINT); err != nil {
 		t.Fatal(err)
@@ -801,5 +802,219 @@ func TestIntegrationCheckUnknownAlias(t *testing.T) {
 	t.Logf("stderr: %s", stderr)
 	if code != 250 || !strings.Contains(stderr, `"ghost"`) {
 		t.Errorf("code=%d, want 250 naming the alias; stderr=%q", code, stderr)
+	}
+}
+
+// jsonEnvelope is SPEC section 6's object as a caller reads it back.
+type jsonEnvelope struct {
+	V           int     `json:"v"`
+	Host        string  `json:"host"`
+	Command     string  `json:"command"`
+	Status      string  `json:"status"`
+	ExitCode    int     `json:"exit_code"`
+	Signal      *string `json:"signal"`
+	DurationMS  int64   `json:"duration_ms"`
+	ConnectMS   int64   `json:"connect_ms"`
+	StdoutBytes int64   `json:"stdout_bytes"`
+	StderrBytes int64   `json:"stderr_bytes"`
+	Truncated   bool    `json:"truncated"`
+	Error       *struct {
+		Kind    string `json:"kind"`
+		Message string `json:"message"`
+	} `json:"error"`
+}
+
+// splitEnvelope takes stdout apart the way "tail -n 1 | jq" does, and returns
+// everything before the final line alongside the parsed envelope.
+func splitEnvelope(t *testing.T, stdout string) (string, jsonEnvelope) {
+	t.Helper()
+	trimmed := strings.TrimSuffix(stdout, "\n")
+	before, last := "", trimmed
+	if i := strings.LastIndex(trimmed, "\n"); i >= 0 {
+		before, last = trimmed[:i+1], trimmed[i+1:]
+	}
+	var env jsonEnvelope
+	if err := json.Unmarshal([]byte(last), &env); err != nil {
+		t.Fatalf("the final stdout line is not the envelope: %v\nline: %q", err, last)
+	}
+	if env.V != 1 {
+		t.Errorf("v = %d, want 1", env.V)
+	}
+	return before, env
+}
+
+// TestIntegrationRunJSONEnvelope is the acceptance table: one real failure of
+// each kind, plus a success, each read back the way a caller would.
+func TestIntegrationRunJSONEnvelope(t *testing.T) {
+	s := sshtest.Start(t)
+	trust := trusting(t, s)
+	cases := []struct {
+		name   string
+		cfg    string
+		args   []string
+		status string
+		code   int
+		kind   string
+	}{
+		{
+			"success", trust,
+			[]string{"--", "echo hi; exit 3"}, "ok", 3, "",
+		},
+		{
+			"auth failure",
+			writeConfig(t, s, hostConfig{knownHosts: s.KnownHostsLine() + "\n", identities: []string{s.RejectedKey.Path}}),
+			[]string{"--", "true"}, "client_error", 252, "auth",
+		},
+		{
+			"hostkey failure",
+			writeConfig(t, s, hostConfig{}),
+			[]string{"--", "true"}, "client_error", 251, "hostkey",
+		},
+		{
+			"network failure",
+			writeConfig(t, s, hostConfig{knownHosts: s.KnownHostsLine() + "\n", port: closedPort(t)}),
+			[]string{"--", "true"}, "client_error", 253, "network",
+		},
+		{
+			"timeout", trust,
+			[]string{"--timeout", "1s", "--", "sleep 30"}, "timeout", 254, "timeout",
+		},
+		{
+			// The trailing sleep keeps the remote alive past the breach, so the
+			// verdict is the cap's rather than a race with the remote's exit.
+			"truncated", trust,
+			[]string{"--max-output", "1KiB", "--", "head -c 5000 /dev/zero; sleep 1"}, "truncated", 254, "truncated",
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			args := append([]string{"run", "h", "--json"}, c.args...)
+			code, stdout, stderr := errand(t, c.cfg, "", args...)
+			t.Logf("exit %d, stderr: %s", code, stderr)
+			before, env := splitEnvelope(t, stdout)
+			if code != c.code {
+				t.Errorf("code=%d, want %d", code, c.code)
+			}
+			if env.ExitCode != code {
+				t.Errorf("exit_code=%d, want the process exit code %d", env.ExitCode, code)
+			}
+			if env.Status != c.status {
+				t.Errorf("status=%q, want %q", env.Status, c.status)
+			}
+			if env.Host != "h" {
+				t.Errorf("host=%q, want %q", env.Host, "h")
+			}
+			switch {
+			case c.kind == "" && env.Error != nil:
+				t.Errorf("error=%+v, want null for an ok run", env.Error)
+			case c.kind != "" && (env.Error == nil || env.Error.Kind != c.kind):
+				t.Errorf("error=%+v, want kind %q", env.Error, c.kind)
+			}
+			switch c.name {
+			case "success":
+				if before != "hi\n" || env.StdoutBytes != 3 || env.StderrBytes != 0 {
+					t.Errorf("stdout before the envelope=%q with %d/%d bytes counted, want %q and 3/0",
+						before, env.StdoutBytes, env.StderrBytes, "hi\n")
+				}
+				if env.Command != "echo hi; exit 3" {
+					t.Errorf("command=%q", env.Command)
+				}
+			case "truncated":
+				if !env.Truncated {
+					t.Error("truncated=false, want true")
+				}
+				if n := env.StdoutBytes + env.StderrBytes; n != 1024 {
+					t.Errorf("counted %d bytes across both streams, want the 1024-byte cap", n)
+				}
+				if delivered := int64(len(before)); delivered != env.StdoutBytes+1 {
+					t.Errorf("delivered %d stdout bytes before the envelope, want %d plus the separating newline",
+						delivered, env.StdoutBytes)
+				}
+			default:
+				if before != "" {
+					t.Errorf("stdout before the envelope=%q, want nothing", before)
+				}
+			}
+			if c.kind != "truncated" && env.Truncated {
+				t.Error("truncated=true, want false")
+			}
+		})
+	}
+}
+
+// TestIntegrationRunJSONCancelled is the one case that needs a signal, so it
+// cannot join the table above.
+func TestIntegrationRunJSONCancelled(t *testing.T) {
+	s := sshtest.Start(t)
+	cmd, stdout, stderr := startErrand(t, trusting(t, s), "run", "h", "--json", "--", "echo started; sleep 30")
+	if err := cmd.Process.Signal(syscall.SIGINT); err != nil {
+		t.Fatal(err)
+	}
+	// Read to EOF before Wait, which closes the pipe out from under us.
+	rest, err := io.ReadAll(stdout)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = cmd.Wait()
+	code := cmd.ProcessState.ExitCode()
+	t.Logf("exit %d after SIGINT, stdout tail %q, stderr: %s", code, rest, stderr)
+	before, env := splitEnvelope(t, string(rest))
+	if code != 130 || env.ExitCode != 130 || env.Status != "cancelled" {
+		t.Errorf("code=%d envelope exit_code=%d status=%q, want 130 and cancelled", code, env.ExitCode, env.Status)
+	}
+	if env.Error == nil || env.Error.Kind != "cancelled" {
+		t.Errorf("error=%+v, want kind cancelled", env.Error)
+	}
+	if before != "" {
+		t.Errorf("stdout between the output and the envelope=%q, want nothing", before)
+	}
+}
+
+// TestIntegrationRunJSONFinalLineIsAlwaysParseable is SPEC section 6's sharp
+// edge end to end: the envelope is separated from output that did not end in a
+// newline, and only from that.
+func TestIntegrationRunJSONFinalLineIsAlwaysParseable(t *testing.T) {
+	s := sshtest.Start(t)
+	cfg := trusting(t, s)
+	cases := []struct {
+		command string
+		before  string
+		bytes   int64
+	}{
+		{"printf nonl", "nonl\n", 4},
+		{"echo hi", "hi\n", 3},
+	}
+	for _, c := range cases {
+		t.Run(c.command, func(t *testing.T) {
+			code, stdout, stderr := errand(t, cfg, "", "run", "h", "--json", "--", c.command)
+			if code != 0 {
+				t.Fatalf("code=%d, want 0; stderr=%q", code, stderr)
+			}
+			before, env := splitEnvelope(t, stdout)
+			if before != c.before {
+				t.Errorf("stdout before the envelope=%q, want %q", before, c.before)
+			}
+			if strings.Contains(stdout, "\n\n") {
+				t.Errorf("a blank line separates the output from the envelope: %q", stdout)
+			}
+			if env.StdoutBytes != c.bytes {
+				t.Errorf("stdout_bytes=%d, want the %d the remote delivered", env.StdoutBytes, c.bytes)
+			}
+		})
+	}
+}
+
+func TestIntegrationCheckJSON(t *testing.T) {
+	s := sshtest.Start(t)
+	code, stdout, stderr := errand(t, trusting(t, s), "", "check", "h", "--json")
+	if code != 0 {
+		t.Fatalf("code=%d, want 0; stderr=%q", code, stderr)
+	}
+	before, env := splitEnvelope(t, stdout)
+	if before != "" || env.Status != "ok" || env.ExitCode != 0 || env.Error != nil {
+		t.Errorf("stdout=%q envelope=%+v, want the envelope alone, ok and 0", stdout, env)
+	}
+	if env.Command != "true" || env.ConnectMS < 0 {
+		t.Errorf("command=%q connect_ms=%d", env.Command, env.ConnectMS)
 	}
 }
