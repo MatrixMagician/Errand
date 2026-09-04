@@ -2,9 +2,14 @@ package main
 
 import (
 	"bytes"
+	"context"
+	"errors"
 	"os"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/MatrixMagician/Errand/internal/result"
 )
 
 func runCLI(t *testing.T, args ...string) (code int, stdout, stderr string) {
@@ -84,6 +89,47 @@ func TestHelpExitsZero(t *testing.T) {
 		code, out, stderr := runCLI(t, args...)
 		if code != 0 || !strings.Contains(out+stderr, "errand run") {
 			t.Errorf("%v: code=%d out=%q stderr=%q", args, code, out, stderr)
+		}
+	}
+}
+
+func TestBudgetsCountConnectInsideTheTotal(t *testing.T) {
+	cases := []struct {
+		name           string
+		total, connect time.Duration
+	}{
+		{"connect shorter", 5 * time.Second, time.Second},
+		{"connect longer", 5 * time.Second, 10 * time.Second},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			run, dial, cancel := budgets(context.Background(), c.total, c.connect)
+			defer cancel()
+			total, ok := run.Deadline()
+			if !ok {
+				t.Fatal("the total budget has no deadline")
+			}
+			conn, ok := dial.Deadline()
+			if !ok {
+				t.Fatal("the connect budget has no deadline")
+			}
+			if conn.After(total) {
+				t.Errorf("connect deadline %v is later than the total deadline %v", conn, total)
+			}
+			if want := min(c.total, c.connect); conn.Sub(time.Now().Add(want)).Abs() > time.Second {
+				t.Errorf("connect deadline is %v away, want about %v", time.Until(conn), want)
+			}
+		})
+	}
+}
+
+func TestBudgetsCauseIsTimeout(t *testing.T) {
+	run, dial, cancel := budgets(context.Background(), time.Millisecond, time.Hour)
+	defer cancel()
+	<-run.Done()
+	for _, ctx := range []context.Context{run, dial} {
+		if !errors.Is(context.Cause(ctx), result.ErrTimeout) {
+			t.Errorf("cause is %v, want a timeout", context.Cause(ctx))
 		}
 	}
 }
