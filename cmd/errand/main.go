@@ -162,6 +162,21 @@ type invocation struct {
 	host config.Host // zero for hosts, which has no alias
 }
 
+// parseErr turns a flag.Parse error into an exit code, whether it came from
+// the flags before the alias or the ones after. -h/--help exits 0 with usage
+// on stdout either way (README: flags go on either side of the alias);
+// anything else is a usage failure. failed is false when perr is nil.
+func parseErr(perr error, sub string, stdout io.Writer, diag client.Diag, env *envelope.Writer) (code int, failed bool) {
+	if perr == nil {
+		return 0, false
+	}
+	if errors.Is(perr, flag.ErrHelp) {
+		fmt.Fprint(stdout, usage)
+		return 0, true
+	}
+	return fail(diag, env, result.Usage, "", fmt.Errorf("%s: %v", sub, perr)), true
+}
+
 // parse is the whole prelude: flags before and after the alias, the config
 // file, the alias, and the arity of what follows it. Every failure is a usage
 // or configuration error, reported here; the caller gets nil and the exit code.
@@ -175,12 +190,8 @@ func parse(sub string, rest []string, stdout, stderr io.Writer) (*invocation, in
 	// Even a failed parse may have seen --json already, and a caller who asked
 	// for machine-readable output wants it for the failure too.
 	env := jsonOutput(nil, o, stdout)
-	if perr != nil {
-		if errors.Is(perr, flag.ErrHelp) {
-			fmt.Fprint(stdout, usage)
-			return nil, 0
-		}
-		return nil, fail(diag, env, result.Usage, "", fmt.Errorf("%s: %v", sub, perr))
+	if code, failed := parseErr(perr, sub, stdout, diag, env); failed {
+		return nil, code
 	}
 
 	cfg, err := config.Load(config.DefaultPath())
@@ -198,8 +209,8 @@ func parse(sub string, rest []string, stdout, stderr io.Writer) (*invocation, in
 	// Flags are also accepted after the host, so parse what follows it.
 	perr = fs.Parse(fs.Args()[1:])
 	env = jsonOutput(env, o, stdout)
-	if perr != nil {
-		return nil, fail(diag, env, result.Usage, "", fmt.Errorf("%s: %v", sub, perr))
+	if code, failed := parseErr(perr, sub, stdout, diag, env); failed {
+		return nil, code
 	}
 	// Only now is --quiet known. Everything above it is a usage error, which
 	// is the one diagnostic an operator needs whether they asked for it or not.
