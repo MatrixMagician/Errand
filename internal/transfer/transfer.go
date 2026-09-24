@@ -33,6 +33,8 @@ const (
 func Put(ctx context.Context, c *client.Conn, local, remote string, mode fs.FileMode, maxSize int64) result.Result {
 	alias := c.Host.Alias
 	r := result.Result{Host: alias, Command: local + " " + remote}
+	early := context.AfterFunc(ctx, func() { c.Abort(abortGrace) })
+	defer early()
 
 	fi, err := os.Stat(local)
 	if err != nil {
@@ -56,13 +58,13 @@ func Put(ctx context.Context, c *client.Conn, local, remote string, mode fs.File
 
 	sc, err := sftp.NewClient(c.Client)
 	if err != nil {
-		r.Err = result.Transfer.Wrap(alias, err)
+		r.Err = requestErr(ctx, alias, err)
 		return r
 	}
 	defer func() { _ = sc.Close() }()
 
 	tmp := tempName(remote)
-	return move(ctx, c, r.Command,
+	return move(ctx, c, r.Command, early,
 		func() (int64, error) { return upload(sc, src, tmp, remote, mode) },
 		func() { _ = sc.Remove(tmp) })
 }
@@ -73,6 +75,8 @@ func Put(ctx context.Context, c *client.Conn, local, remote string, mode fs.File
 func Get(ctx context.Context, c *client.Conn, remote, local string, maxSize int64) result.Result {
 	alias := c.Host.Alias
 	r := result.Result{Host: alias, Command: remote + " " + local}
+	early := context.AfterFunc(ctx, func() { c.Abort(abortGrace) })
+	defer early()
 
 	if fi, err := os.Stat(local); err == nil && fi.IsDir() {
 		r.Err = result.Usage.Wrap(alias, fmt.Errorf("%s is a directory, and get names the file to write", local))
@@ -85,14 +89,14 @@ func Get(ctx context.Context, c *client.Conn, remote, local string, maxSize int6
 
 	sc, err := sftp.NewClient(c.Client)
 	if err != nil {
-		r.Err = result.Transfer.Wrap(alias, err)
+		r.Err = requestErr(ctx, alias, err)
 		return r
 	}
 	defer func() { _ = sc.Close() }()
 
 	fi, err := sc.Stat(remote)
 	if err != nil {
-		r.Err = result.Transfer.Wrap(alias, err)
+		r.Err = requestErr(ctx, alias, err)
 		return r
 	}
 	if fi.IsDir() {
@@ -105,15 +109,25 @@ func Get(ctx context.Context, c *client.Conn, remote, local string, maxSize int6
 	}
 	src, err := sc.Open(remote)
 	if err != nil {
-		r.Err = result.Transfer.Wrap(alias, err)
+		r.Err = requestErr(ctx, alias, err)
 		return r
 	}
 	defer func() { _ = src.Close() }()
 
 	tmp := localTempName(local)
-	return move(ctx, c, r.Command,
+	return move(ctx, c, r.Command, early,
 		func() (int64, error) { return download(src, tmp, local) },
 		func() { _ = os.Remove(tmp) })
+}
+
+// requestErr scores a failed SFTP request made before the copy. A done context
+// means the early abort closed the connection under it, so the timeout or
+// interrupt is the cause rather than whatever the request reported.
+func requestErr(ctx context.Context, alias string, err error) error {
+	if ctx.Err() != nil {
+		return result.StopCause(ctx)
+	}
+	return result.Transfer.Wrap(alias, err)
 }
 
 // move runs the copy a transfer is and scores it. body writes to a temporary
@@ -121,8 +135,17 @@ func Get(ctx context.Context, c *client.Conn, remote, local string, maxSize int6
 // holds it. Cancellation gets discard in while the connection is still up, then
 // takes the socket away, and move does not return until that window has closed:
 // returning earlier would let the caller's Conn.Close cut cleanup short.
-func move(ctx context.Context, c *client.Conn, command string, body func() (int64, error), discard func()) result.Result {
+//
+// early is the caller's plain abort, armed before its first SFTP request so a
+// remote open or stat that never returns still ends inside the budget. move
+// takes over from it here; if it already fired there is no connection to copy
+// over.
+func move(ctx context.Context, c *client.Conn, command string, early func() bool, body func() (int64, error), discard func()) result.Result {
 	r := result.Result{Host: c.Host.Alias, Command: command}
+	if !early() {
+		r.Err = result.StopCause(ctx)
+		return r
+	}
 	cleaned := make(chan struct{})
 	stop := context.AfterFunc(ctx, func() {
 		defer close(cleaned)

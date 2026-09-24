@@ -36,11 +36,21 @@ type Request struct {
 func Run(ctx context.Context, c *client.Conn, req Request) result.Result {
 	alias := c.Host.Alias
 	r := result.Result{Host: alias, Command: req.Command}
+	// Session setup waits on a reply per request, so the abort is armed before
+	// the first one and handed to teardown once the command is running.
+	early := context.AfterFunc(ctx, func() { c.Abort(teardownGrace) })
+	defer early()
+	fail := func(err error) result.Result {
+		r.Err = result.Exec.Wrap(alias, err)
+		if ctx.Err() != nil {
+			r.Err = result.StopCause(ctx)
+		}
+		return r
+	}
 
 	sess, err := c.NewSession()
 	if err != nil {
-		r.Err = result.Exec.Wrap(alias, err)
-		return r
+		return fail(err)
 	}
 	defer func() { _ = sess.Close() }()
 
@@ -54,8 +64,7 @@ func Run(ctx context.Context, c *client.Conn, req Request) result.Result {
 	if req.Stdin != nil {
 		w, err := sess.StdinPipe()
 		if err != nil {
-			r.Err = result.Exec.Wrap(alias, err)
-			return r
+			return fail(err)
 		}
 		// Detached and never joined: Wait drains its own stdin copier, and
 		// would block forever on a local stdin that never reaches EOF.
@@ -67,8 +76,7 @@ func Run(ctx context.Context, c *client.Conn, req Request) result.Result {
 
 	if req.PTY {
 		if err := sess.RequestPty("xterm", 24, 80, ssh.TerminalModes{ssh.ECHO: 0}); err != nil {
-			r.Err = result.Exec.Wrap(alias, err)
-			return r
+			return fail(err)
 		}
 	}
 
@@ -81,7 +89,10 @@ func Run(ctx context.Context, c *client.Conn, req Request) result.Result {
 	}
 
 	if err := sess.Start(req.Command); err != nil {
-		r.Err = result.Exec.Wrap(alias, err)
+		return fail(err)
+	}
+	if !early() {
+		r.Err = result.StopCause(ctx)
 		return r
 	}
 	waitC := make(chan error, 1)
