@@ -30,8 +30,11 @@ type hookToolInput struct {
 // scanner shows up here.
 func TestHookApprovesOnlyUnattendedErrandCommands(t *testing.T) {
 	python, err := exec.LookPath("python3")
-	if err != nil {
+	switch {
+	case err != nil && os.Getenv("ERRAND_TEST_REQUIRE_PYTHON") != "1":
 		t.Skip("python3 not on PATH; the hook test needs it")
+	case err != nil:
+		t.Fatalf("python3 not on PATH: %v", err)
 	}
 	cfg := sshtest.WriteFile(t, t.TempDir(), "config.toml", `[defaults]
 allow_commands = ["df", "uptime", "systemctl status"]
