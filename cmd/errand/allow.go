@@ -4,6 +4,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
+	"path/filepath"
 	"strings"
 
 	allowlist "github.com/MatrixMagician/Errand/internal/allow"
@@ -11,6 +13,12 @@ import (
 
 // errPut is put's verdict: every write to a Host is put to the human.
 var errPut = errors.New("put")
+
+// errGetOutsideCwd is get's verdict when its local destination does not
+// resolve inside the current working directory (issue #47): get writes
+// wherever it is told, so a destination outside cwd is put to the human the
+// same as put.
+var errGetOutsideCwd = errors.New("get outside cwd")
 
 // allow answers whether the invocation in rest would be Unattended. It parses
 // exactly as the judged subcommand would, so a usage or configuration error is
@@ -43,6 +51,8 @@ func allow(rest []string, stdout, stderr io.Writer) int {
 	switch inv.sub {
 	case "put":
 		verdict = errPut
+	case "get":
+		verdict = checkGetDestination(inv.fs.Arg(1))
 	case "run":
 		verdict = allowlist.Check(inv.host.AllowCommands, strings.Join(inv.fs.Args(), " "))
 	}
@@ -51,4 +61,37 @@ func allow(rest []string, stdout, stderr io.Writer) int {
 	}
 	fmt.Fprintln(stdout, verdict)
 	return 1
+}
+
+// checkGetDestination is get's verdict: nil when local resolves inside the
+// current working directory, else errGetOutsideCwd. cwd and local's parent
+// are both symlink-resolved before comparing, so a symlinked cwd (macOS's
+// /tmp, a symlinked home) does not make an in-cwd get look like an escape,
+// and a symlinked parent that escapes cwd does not stand in for a plain path
+// outside it. Either resolution failing to run fails closed rather than
+// falling back to an unresolved comparison, so the verdict never depends on
+// local's parent existing yet, even though get is what creates it.
+func checkGetDestination(local string) error {
+	cwd, err := os.Getwd()
+	if err != nil {
+		return errGetOutsideCwd
+	}
+	cwd, err = filepath.EvalSymlinks(cwd)
+	if err != nil {
+		return errGetOutsideCwd
+	}
+	abs, err := filepath.Abs(local)
+	if err != nil {
+		return errGetOutsideCwd
+	}
+	resolved, err := filepath.EvalSymlinks(filepath.Dir(abs))
+	if err != nil {
+		return errGetOutsideCwd
+	}
+	abs = filepath.Join(resolved, filepath.Base(abs))
+	rel, err := filepath.Rel(cwd, abs)
+	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return errGetOutsideCwd
+	}
+	return nil
 }

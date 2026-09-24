@@ -63,7 +63,7 @@ errand version
 
 `<host>` is always an alias from the config file, never `user@hostname`. Flags go before or after the alias, but before the command or the paths. `errand --help` and `errand <subcommand> --help` print the same usage text as this section.
 
-`errand allow` takes the tail of any `errand` invocation and answers whether a harness may run it without asking a human: exit 0 and nothing on stdout when the command is on the host's `allow_commands` list, exit 1 and a one-line reason on stdout when it is not, exit 250 for the usage and configuration errors the judged subcommand would raise. `hosts`, `version`, `help`, `check`, and `get` always pass; `put` never does; `run` is judged by its command. `run`, `put`, and `get` never consult the list themselves (ADR-0003).
+`errand allow` takes the tail of any `errand` invocation and answers whether a harness may run it without asking a human: exit 0 and nothing on stdout when the command is on the host's `allow_commands` list, exit 1 and a one-line reason on stdout when it is not, exit 250 for the usage and configuration errors the judged subcommand would raise. `hosts`, `version`, `help`, and `check` always pass; `put` never does; `get` passes only when its local destination resolves inside the current working directory; `run` is judged by its command. `run`, `put`, and `get` never consult the list themselves (ADR-0003).
 
 ```sh
 # harness
@@ -269,7 +269,7 @@ The rules stop at a plain pipeline on purpose. Anything the check does not under
 
 ### Verdicts by subcommand
 
-`hosts`, `version`, `help`, `check`, and `get` always pass. `put` never does, with the reason `put`. `run` is judged by its command. Flags such as `--json`, `--quiet`, `--stdin`, `--env`, and `--timeout` leave the verdict alone, but they still have to parse, so a bad flag is exit 250 exactly as it would be for the subcommand itself. `allow` never connects and writes nothing to the audit log.
+`hosts`, `version`, `help`, and `check` always pass. `put` never does, with the reason `put`. `get` passes when its local destination resolves inside the current working directory, checked with `filepath.Abs` then `filepath.Rel(cwd, dest)` and no leading `..`, with symlinks in both cwd and the destination's parent resolved first and a resolution failure (a missing parent directory) failing closed; otherwise the reason is `get outside cwd`. `run` is judged by its command. Flags such as `--json`, `--quiet`, `--stdin`, `--env`, and `--timeout` leave the verdict alone, but they still have to parse, so a bad flag is exit 250 exactly as it would be for the subcommand itself. `allow` never connects and writes nothing to the audit log.
 
 ## Host keys
 
