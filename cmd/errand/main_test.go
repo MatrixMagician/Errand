@@ -106,7 +106,8 @@ func TestMalformedConfig(t *testing.T) {
 }
 
 func TestHelpExitsZero(t *testing.T) {
-	for _, args := range [][]string{{"--help"}, {"-h"}, {"help"}, {"run", "--help"}} {
+	t.Setenv("ERRAND_CONFIG", "testdata/fixture.toml")
+	for _, args := range [][]string{{"--help"}, {"-h"}, {"help"}, {"run", "--help"}, {"run", "h", "-h"}} {
 		code, out, stderr := runCLI(t, args...)
 		if code != 0 || !strings.Contains(out+stderr, "errand run") {
 			t.Errorf("%v: code=%d out=%q stderr=%q", args, code, out, stderr)

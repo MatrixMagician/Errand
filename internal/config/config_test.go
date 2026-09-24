@@ -132,6 +132,7 @@ func TestRejects(t *testing.T) {
 		"bad port":           "[hosts.a]\nhostname = \"a\"\nport = 70000\n",
 		"bad duration":       "[hosts.a]\nhostname = \"a\"\ntimeout = \"soon\"\n",
 		"bad size":           "[hosts.a]\nhostname = \"a\"\nmax_output = \"1GB\"\n",
+		"overflowing size":   "[hosts.a]\nhostname = \"a\"\nmax_output = \"9223372036854775807KiB\"\n",
 		"bad allow_commands": "[hosts.a]\nhostname = \"a\"\nallow_commands = \"df\"\n",
 	}
 	for name, body := range cases {
@@ -177,7 +178,7 @@ func TestParseSize(t *testing.T) {
 			t.Errorf("ParseSize(%q) = %d, %v; want %d", in, got, err, want)
 		}
 	}
-	for _, in := range []string{"", "-1", "1GB", "KiB", "1.5MiB", "1MB"} {
+	for _, in := range []string{"", "-1", "1GB", "KiB", "1.5MiB", "1MB", "9223372036854775807KiB"} {
 		if _, err := ParseSize(in); err == nil {
 			t.Errorf("ParseSize(%q) should fail", in)
 		}

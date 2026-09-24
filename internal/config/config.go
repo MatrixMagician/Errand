@@ -5,6 +5,7 @@ package config
 import (
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"os/user"
 	"path/filepath"
@@ -103,6 +104,9 @@ func ParseSize(s string) (int64, error) {
 	n, err := strconv.ParseInt(s, 10, 64)
 	if err != nil || n < 0 || s == "" {
 		return 0, fmt.Errorf("size %q: want a non-negative integer with optional KiB/MiB suffix", orig)
+	}
+	if n > math.MaxInt64/mult {
+		return 0, fmt.Errorf("size %q: overflows", orig)
 	}
 	return n * mult, nil
 }
