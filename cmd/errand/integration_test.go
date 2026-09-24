@@ -1707,6 +1707,31 @@ func TestIntegrationGetInterrupted(t *testing.T) {
 	}
 }
 
+// TestIntegrationGetTimeoutBeforeTheCopy puts the hang before the first byte:
+// the remote open of a FIFO with no writer never returns, so only an abort
+// armed before the SFTP requests can end the get inside --timeout.
+func TestIntegrationGetTimeoutBeforeTheCopy(t *testing.T) {
+	s := sshtest.Start(t)
+	cfg := trusting(t, s)
+	fifo := remoteDir(t, cfg) + "/fifo"
+	remote(t, cfg, "mkfifo "+fifo)
+	// A writer releases the sftp-server still blocked in open(2).
+	t.Cleanup(func() { errand(t, cfg, "", "run", "h", "--", "timeout 2 sh -c 'echo > "+fifo+"'") })
+
+	down := t.TempDir()
+	code, stderr, took := timed(t, cfg, "get", "h", "--timeout", "500ms", fifo, filepath.Join(down, "file"))
+	if code != 254 || !strings.Contains(stderr, "timeout") {
+		t.Errorf("code=%d stderr=%q, want 254 and a timeout diagnostic", code, stderr)
+	}
+	// The 500ms budget, then the 2s abort grace, with slack for connecting.
+	if took > 4*time.Second {
+		t.Errorf("took %v: the get waited on a remote open that never returns", took)
+	}
+	if got := entries(t, down); len(got) != 0 {
+		t.Errorf("destination directory holds %q, want nothing", got)
+	}
+}
+
 // readmeExample is one line of a README ```sh block marked "# harness", and
 // the exit code it promises: 0 unless the line ends "# exit N".
 type readmeExample struct {
