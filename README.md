@@ -360,7 +360,7 @@ errand run web-prod -- /tmp/restart.sh
 errand get web-prod /tmp/restart.sh restart.copy
 ```
 
-`put` writes to `.<name>.errand-<pid>` in the destination directory and renames it into place, so a partial upload never appears under the final name. `get` does the same in the local destination directory. A timeout or an interrupt removes the temporary file when the connection can still carry the request. The final name never appears either way.
+`put` writes to `.<name>.errand-<16 random hex digits>` in the destination directory and renames it into place, so a partial upload never appears under the final name. The temporary is created exclusively, so a symlink someone planted in a shared directory makes the transfer fail instead of being written through, and `--mode` is applied before the first byte. `get` does the same in the local destination directory. A timeout or an interrupt removes the temporary file when the connection can still carry the request. The final name never appears either way.
 
 `--max-size` is checked against the source file before any bytes move, and again as they move: a source that grows past the limit mid-copy fails with exit 253 and nothing appears under the final name. A source over the limit, a source that is not a regular file (such as `/dev/zero` or a FIFO), a missing local source, a local directory as `put`'s source, or a missing local destination directory for `get` is a usage error, exit 250. A remote directory as `get`'s source is an SFTP error, exit 253. `put` sets the remote permission bits from `--mode`. `get` writes the local file `0644` before your umask, whatever the remote bits were.
 
