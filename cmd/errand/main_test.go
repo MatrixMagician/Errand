@@ -434,7 +434,9 @@ func TestAllowGetResolvesSymlinkedCwd(t *testing.T) {
 
 // TestAllowJudgesRunByItsCommand covers the one verdict the operator controls:
 // the Host's list replaces the defaults', the separator is optional, and no
-// flag on either side of the alias moves the answer.
+// flag but --env on either side of the alias moves the answer. --env moves it
+// unconditionally (issue #48): sshd's AcceptEnv is the only gate on what a
+// forwarded variable can do to a listed command, and errand cannot see it.
 func TestAllowJudgesRunByItsCommand(t *testing.T) {
 	t.Setenv("ERRAND_CONFIG", "testdata/fixture.toml")
 	cases := []struct {
@@ -448,8 +450,10 @@ func TestAllowJudgesRunByItsCommand(t *testing.T) {
 		{args: []string{"run", "web-prod", "--", "df"}, code: 1, stdout: "not on allowlist: df\n"},
 		{args: []string{"run", "web-prod", "--", "uptime"}},
 		{args: []string{"run", "lab", "df", "-h"}},
-		{args: []string{"run", "--json", "lab", "--quiet", "--timeout", "5s", "--stdin", "--env", "A=b", "--max-output", "1KiB", "--", "df", "-h"}},
+		{args: []string{"run", "--json", "lab", "--quiet", "--timeout", "5s", "--stdin", "--max-output", "1KiB", "--", "df", "-h"}},
 		{args: []string{"run", "--json", "lab", "--", "reboot"}, code: 1, stdout: "not on allowlist: reboot\n"},
+		{args: []string{"run", "lab", "--env", "A=b", "--", "df"}, code: 1, stdout: "env\n"},
+		{args: []string{"run", "lab", "--env", "A=b", "df"}, code: 1, stdout: "env\n"},
 	}
 	for _, c := range cases {
 		t.Run(strings.Join(c.args, " "), func(t *testing.T) {
