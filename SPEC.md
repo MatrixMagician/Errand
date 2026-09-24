@@ -137,7 +137,7 @@ Configuration lives in a single TOML file, default `~/.config/errand/config.toml
 user            = "oliverh"
 timeout         = "120s"
 max_output      = "1MiB"
-known_hosts     = "~/.ssh/known_hosts"     # may list several files
+known_hosts     = ["~/.ssh/known_hosts"]   # may list several files
 identity_files  = ["~/.ssh/id_ed25519"]    # tried after the agent
 
 [hosts.web-prod]

@@ -111,33 +111,12 @@ func ParseSize(s string) (int64, error) {
 	return n * mult, nil
 }
 
-// paths accepts either a single string or an array of strings in TOML.
-type paths []string
-
-func (p *paths) UnmarshalTOML(v any) error {
-	switch x := v.(type) {
-	case string:
-		*p = []string{x}
-	case []any:
-		for _, e := range x {
-			s, ok := e.(string)
-			if !ok {
-				return errors.New("want a string or a list of strings")
-			}
-			*p = append(*p, s)
-		}
-	default:
-		return errors.New("want a string or a list of strings")
-	}
-	return nil
-}
-
 type defaults struct {
 	User          string    `toml:"user"`
 	Timeout       *Duration `toml:"timeout"`
 	MaxOutput     *Size     `toml:"max_output"`
-	KnownHosts    paths     `toml:"known_hosts"`
-	IdentityFiles paths     `toml:"identity_files"`
+	KnownHosts    []string  `toml:"known_hosts"`
+	IdentityFiles []string  `toml:"identity_files"`
 	AuditLog      string    `toml:"audit_log"`
 	AllowCommands []string  `toml:"allow_commands"`
 }
@@ -240,25 +219,20 @@ func (f *File) Resolve(alias string) (Host, error) {
 	if h.User == "" {
 		h.User = localUser()
 	}
-	if t := firstSet(s.Timeout, d.Timeout); t != nil {
-		h.Timeout = time.Duration(*t)
+	if s.Timeout != nil {
+		h.Timeout = time.Duration(*s.Timeout)
+	} else if d.Timeout != nil {
+		h.Timeout = time.Duration(*d.Timeout)
 	}
-	if m := firstSet(s.MaxOutput, d.MaxOutput); m != nil {
-		h.MaxOutput = *m
+	if s.MaxOutput != nil {
+		h.MaxOutput = *s.MaxOutput
+	} else if d.MaxOutput != nil {
+		h.MaxOutput = *d.MaxOutput
 	}
 	if s.AllowCommands != nil {
 		h.AllowCommands = s.AllowCommands
 	}
 	return h, nil
-}
-
-func firstSet[T any](ps ...*T) *T {
-	for _, p := range ps {
-		if p != nil {
-			return p
-		}
-	}
-	return nil
 }
 
 func expandAll(ps []string) []string {

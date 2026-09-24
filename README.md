@@ -163,7 +163,7 @@ errand run web-prod --max-output 1KiB -- yes  # exit 254
 user           = "oliverh"
 timeout        = "120s"
 max_output     = "1MiB"
-known_hosts    = "~/.ssh/known_hosts"
+known_hosts    = ["~/.ssh/known_hosts"]
 identity_files = ["~/.ssh/id_ed25519"]
 audit_log      = "~/.local/state/errand/audit.jsonl"
 
@@ -190,8 +190,8 @@ host_key = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI..."
 | `timeout` | duration | `120s` | `--timeout` for hosts that do not set their own. |
 | `max_output` | size | `1MiB` | `--max-output` for hosts that do not set their own. |
 | `allow_commands` | list of strings | none | Commands an agent may run Unattended, for hosts that do not set their own list. See [Command allowlist](#command-allowlist). |
-| `known_hosts` | string or list of strings | none | Files to verify host keys against, in OpenSSH format. Files that do not exist are skipped. With no readable file, every host key is unknown. |
-| `identity_files` | string or list of strings | none | Private key files to try after the SSH agent, in order. |
+| `known_hosts` | list of strings | none | Files to verify host keys against, in OpenSSH format. Files that do not exist are skipped. With no readable file, every host key is unknown. |
+| `identity_files` | list of strings | none | Private key files to try after the SSH agent, in order. |
 | `audit_log` | string | `$XDG_STATE_HOME/errand/audit.jsonl`, else `~/.local/state/errand/audit.jsonl` | Where operations are recorded. |
 
 ### `[hosts.<alias>]`
