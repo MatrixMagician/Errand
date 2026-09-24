@@ -159,7 +159,7 @@ func TestMissingFile(t *testing.T) {
 	}
 }
 
-func TestKnownHostsStringOrList(t *testing.T) {
+func TestKnownHostsList(t *testing.T) {
 	cfg, err := Load(write(t, "[defaults]\nknown_hosts = [\"/a\", \"/b\"]\n[hosts.h]\nhostname = \"h\"\n"))
 	if err != nil {
 		t.Fatal(err)
@@ -167,6 +167,14 @@ func TestKnownHostsStringOrList(t *testing.T) {
 	h, _ := cfg.Resolve("h")
 	if len(h.KnownHosts) != 2 || h.KnownHosts[1] != "/b" {
 		t.Errorf("known_hosts list: %v", h.KnownHosts)
+	}
+}
+
+// TestKnownHostsBareStringIsRejected pins the compat break: known_hosts and
+// identity_files now take only a list, not a bare string.
+func TestKnownHostsBareStringIsRejected(t *testing.T) {
+	if _, err := Load(write(t, "[defaults]\nknown_hosts = \"/a\"\n[hosts.h]\nhostname = \"h\"\n")); err == nil {
+		t.Error("bare string known_hosts should be a load error")
 	}
 }
 

@@ -19,27 +19,27 @@ var (
 )
 
 // Check returns nil when command passes list, else the reason it does not,
-// worded as the one line errand allow prints. A segment's own verdict outranks
-// the construct that ended the scan, so sudo cat > x says sudo and reboot > x
-// says not on allowlist: reboot.
+// worded as the one line errand allow prints. Any reason makes the command
+// ask, so a bad construct is reported before the segments scanned before it
+// are judged: sudo cat > x and reboot > x both say redirection.
 func Check(list []string, command string) error {
 	segments, err := scan(command)
+	if err != nil {
+		return err
+	}
 	for _, words := range segments {
 		if verdict := judge(list, words); verdict != nil {
 			return verdict
 		}
 	}
-	return err
+	return nil
 }
 
 // scan tokenises command into pipeline segments the way the remote shell
 // would. It walks bytes rather than runes because every special character here
 // is ASCII, so the bytes of a multibyte UTF-8 sequence fall through the literal
 // branch unchanged. A backtick or $( inside double quotes is still a
-// substitution, because the remote shell expands both there. On a failing
-// construct it still returns every segment completed so far, plus the segment
-// being built when the construct was hit, so Check can judge what is already
-// known before reporting it.
+// substitution, because the remote shell expands both there.
 func scan(command string) ([][]string, error) {
 	const (
 		none   byte = 0
@@ -60,13 +60,6 @@ func scan(command string) ([][]string, error) {
 			open = false
 		}
 	}
-	fail := func(err error) ([][]string, error) {
-		closeWord()
-		if len(segment) > 0 {
-			segments = append(segments, segment)
-		}
-		return segments, err
-	}
 
 	n := len(command)
 	for i := 0; i < n; i++ {
@@ -85,9 +78,9 @@ func scan(command string) ([][]string, error) {
 			case c == double:
 				quote = none
 			case c == '`':
-				return fail(errSubstitution)
+				return nil, errSubstitution
 			case c == '$' && i+1 < n && command[i+1] == '(':
-				return fail(errSubstitution)
+				return nil, errSubstitution
 			case c == '\\' && i+1 < n && strings.IndexByte("$\"\\`\n", command[i+1]) >= 0:
 				word.WriteByte(command[i+1])
 				open = true
@@ -101,7 +94,7 @@ func scan(command string) ([][]string, error) {
 		switch {
 		case c == '\\':
 			if i+1 >= n {
-				return fail(errUnparseable)
+				return nil, errUnparseable
 			}
 			word.WriteByte(command[i+1])
 			open = true
@@ -112,26 +105,26 @@ func scan(command string) ([][]string, error) {
 		case c == ' ' || c == '\t':
 			closeWord()
 		case c == '\n' || c == ';' || c == '&':
-			return fail(errControl)
+			return nil, errControl
 		case c == '|' && i+1 < n && command[i+1] == '|':
-			return fail(errControl)
+			return nil, errControl
 		case c == '|':
 			closeWord()
 			segments = append(segments, segment)
 			segment = nil
 		case c == '>' || c == '<':
-			return fail(errRedirection)
+			return nil, errRedirection
 		case c == '`':
-			return fail(errSubstitution)
+			return nil, errSubstitution
 		case c == '$' && i+1 < n && command[i+1] == '(':
-			return fail(errSubstitution)
+			return nil, errSubstitution
 		default:
 			word.WriteByte(c)
 			open = true
 		}
 	}
 	if quote != none {
-		return fail(errUnparseable)
+		return nil, errUnparseable
 	}
 	closeWord()
 	segments = append(segments, segment)
@@ -145,11 +138,11 @@ func judge(list []string, words []string) error {
 	if len(words) == 0 {
 		return errUnparseable
 	}
-	// sudo alone is still caught by basename, so /usr/bin/sudo is refused the
-	// same as sudo. The allowlist match below is exact on both sides: a path
-	// in the command or the entry means that path, not whatever file happens
-	// to share its last element.
-	if basename(words[0]) == "sudo" {
+	// sudo alone is still caught by its basename, so /usr/bin/sudo is refused
+	// the same as sudo. The allowlist match below is exact on both sides: a
+	// path in the command or the entry means that path, not whatever file
+	// happens to share its last element.
+	if words[0][strings.LastIndex(words[0], "/")+1:] == "sudo" {
 		return errSudo
 	}
 	if strings.Contains(words[0], "=") {
@@ -168,9 +161,4 @@ func judge(list []string, words []string) error {
 	}
 	leading := words[:min(n, len(words))]
 	return fmt.Errorf("not on allowlist: %s", strings.Join(leading, " "))
-}
-
-// basename is the last path element of s, or s unchanged when it has none.
-func basename(s string) string {
-	return s[strings.LastIndex(s, "/")+1:]
 }

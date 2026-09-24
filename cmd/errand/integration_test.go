@@ -81,7 +81,7 @@ func writeConfig(t *testing.T, s *sshtest.Server, o hostConfig) string {
 	kh := sshtest.WriteFile(t, dir, "known_hosts", o.knownHosts)
 	return sshtest.WriteFile(t, dir, "config.toml", fmt.Sprintf(`[defaults]
 user           = "root"
-known_hosts    = %q
+known_hosts    = [%q]
 identity_files = [%s]
 allow_commands = ["uname", "ls", "df", "uptime", "systemctl status"]
 audit_log      = %q

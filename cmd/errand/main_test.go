@@ -592,7 +592,7 @@ func TestAllowMatchingRules(t *testing.T) {
 		{name: "fd redirection", args: []string{"run", "h", "--", "cat", "2>&1"}, code: 1, stdout: "redirection\n"},
 		{name: "sudo before a listed command", args: []string{"run", "h", "--", "sudo", "cat", "/etc/shadow"}, code: 1, stdout: "sudo\n"},
 		{name: "sudo with a path", args: []string{"run", "h", "--", "/usr/bin/sudo", "cat"}, code: 1, stdout: "sudo\n"},
-		{name: "sudo outranks the redirection after it", args: []string{"run", "h", "--", "sudo", "cat", ">", "x"}, code: 1, stdout: "sudo\n"},
+		{name: "a construct that ends the scan outranks a segment before it", args: []string{"run", "h", "--", "sudo", "cat", ">", "x"}, code: 1, stdout: "redirection\n"},
 		{name: "env prefix", args: []string{"run", "h", "--", "LANG=C", "grep", "x", "y"}, code: 1, stdout: "env prefix\n"},
 		{name: "semicolon", args: []string{"run", "h", "--", "cat", "a;", "rm", "b"}, code: 1, stdout: "control operator\n"},
 		{name: "and-and", args: []string{"run", "h", "--", "cat", "a", "&&", "rm", "b"}, code: 1, stdout: "control operator\n"},
@@ -610,7 +610,7 @@ func TestAllowMatchingRules(t *testing.T) {
 		{name: "empty segment between two pipes", args: []string{"run", "h", "--", "cat", "a", "|", "|", "cat"}, code: 1, stdout: "unparseable\n"},
 		{name: "trailing backslash", args: []string{"run", "h", "--", "cat", "a", `\`}, code: 1, stdout: "unparseable\n"},
 		{name: "whitespace-only command", args: []string{"run", "h", "--", "  "}, code: 1, stdout: "unparseable\n"},
-		{name: "unlisted command before the redirection that follows it", args: []string{"run", "h", "--", "reboot", ">", "x"}, code: 1, stdout: "not on allowlist: reboot\n"},
+		{name: "unlisted command before the redirection that follows it", args: []string{"run", "h", "--", "reboot", ">", "x"}, code: 1, stdout: "redirection\n"},
 		{name: "sudo in the second segment", args: []string{"run", "h", "--", "grep", "x", "|", "sudo", "cat"}, code: 1, stdout: "sudo\n"},
 	}
 	for _, c := range cases {

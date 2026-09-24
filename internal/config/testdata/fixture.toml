@@ -2,7 +2,7 @@
 user            = "oliverh"
 timeout         = "120s"
 max_output      = "1MiB"
-known_hosts     = "~/.ssh/known_hosts"
+known_hosts     = ["~/.ssh/known_hosts"]
 identity_files  = ["~/.ssh/id_ed25519"]
 allow_commands  = ["df", "uptime"]
 
