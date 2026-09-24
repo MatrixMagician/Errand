@@ -74,12 +74,15 @@ def simple_command(command: str) -> list[str] | None:
 
 
 def is_the_errand_on_path(word: str, errand: str) -> bool:
-    """A bare `errand` resolves to the same binary the verdict comes from. A path
-    is accepted only when it is that binary: judging one program's arguments
-    and then running another would approve whatever wears the name."""
+    """A bare `errand` resolves via PATH to the same binary the verdict comes
+    from. A relative path is refused outright: it resolves against this
+    hook's cwd, which need not be the Bash tool's cwd, so the file verified
+    here may not be the file that runs. An absolute path is accepted only
+    when it is that same binary: judging one program's arguments and then
+    running another would approve whatever wears the name."""
     if word == "errand":
         return True
-    return os.sep in word and os.path.realpath(word) == os.path.realpath(errand)
+    return word.startswith(os.sep) and os.path.realpath(word) == os.path.realpath(errand)
 
 
 def main() -> int:

@@ -50,10 +50,15 @@ hostname = "127.0.0.1"
 		"SSH_AUTH_SOCK=",
 	)
 
-	run := func(t *testing.T, env []string, stdin string) string {
+	run := func(t *testing.T, env []string, stdin, dir string) string {
 		t.Helper()
-		cmd := exec.Command(python, hookScript)
+		script, err := filepath.Abs(hookScript)
+		if err != nil {
+			t.Fatal(err)
+		}
+		cmd := exec.Command(python, script)
 		cmd.Env = env
+		cmd.Dir = dir
 		cmd.Stdin = strings.NewReader(stdin)
 		var stdout, stderr strings.Builder
 		cmd.Stdout, cmd.Stderr = &stdout, &stderr
@@ -89,10 +94,17 @@ hostname = "127.0.0.1"
 		}
 	}
 
+	relDir := t.TempDir()
+	relErrand := filepath.Join(relDir, "errand")
+	if err := os.Symlink(bin, relErrand); err != nil {
+		t.Fatal(err)
+	}
+
 	cases := []struct {
 		name    string
 		tool    string
 		command string
+		dir     string
 		allowed bool
 	}{
 		{name: "listed command", command: "errand run h -- df -h", allowed: true},
@@ -104,6 +116,7 @@ hostname = "127.0.0.1"
 		{name: "get", command: "errand get h /etc/hostname hostname.copy", allowed: true},
 		{name: "absolute path to errand", command: bin + " hosts", allowed: true},
 		{name: "another binary named errand", command: impostor + " hosts"},
+		{name: "relative path to the real errand binary", command: "./errand run h -- df", dir: relDir},
 
 		{name: "unlisted command", command: "errand run h -- reboot"},
 		{name: "sudo", command: "errand run h -- sudo df"},
@@ -131,7 +144,7 @@ hostname = "127.0.0.1"
 			if err != nil {
 				t.Fatalf("marshal event: %v", err)
 			}
-			stdout := run(t, env, string(stdin))
+			stdout := run(t, env, string(stdin), tc.dir)
 			if !tc.allowed {
 				if stdout != "" {
 					t.Fatalf("stdout = %q, want empty", stdout)
@@ -143,7 +156,7 @@ hostname = "127.0.0.1"
 	}
 
 	t.Run("stdin is not json", func(t *testing.T) {
-		if stdout := run(t, env, "not json"); stdout != "" {
+		if stdout := run(t, env, "not json", ""); stdout != "" {
 			t.Fatalf("stdout = %q, want empty", stdout)
 		}
 	})
@@ -154,7 +167,7 @@ hostname = "127.0.0.1"
 		if err != nil {
 			t.Fatalf("marshal event: %v", err)
 		}
-		if stdout := run(t, bare, string(stdin)); stdout != "" {
+		if stdout := run(t, bare, string(stdin), ""); stdout != "" {
 			t.Fatalf("stdout = %q, want empty", stdout)
 		}
 	})
