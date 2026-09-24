@@ -145,8 +145,11 @@ func judge(list []string, words []string) error {
 	if len(words) == 0 {
 		return errUnparseable
 	}
-	first := words[0][strings.LastIndex(words[0], "/")+1:]
-	if first == "sudo" {
+	// sudo alone is still caught by basename, so /usr/bin/sudo is refused the
+	// same as sudo. The allowlist match below is exact on both sides: a path
+	// in the command or the entry means that path, not whatever file happens
+	// to share its last element.
+	if basename(words[0]) == "sudo" {
 		return errSudo
 	}
 	if strings.Contains(words[0], "=") {
@@ -155,7 +158,7 @@ func judge(list []string, words []string) error {
 	n := 1
 	for _, e := range list {
 		fields := strings.Fields(e)
-		if len(fields) == 0 || fields[0] != first {
+		if len(fields) == 0 || fields[0] != words[0] {
 			continue
 		}
 		if len(fields) <= len(words) && slices.Equal(fields[1:], words[1:len(fields)]) {
@@ -163,7 +166,11 @@ func judge(list []string, words []string) error {
 		}
 		n = max(n, len(fields))
 	}
-	leading := slices.Clone(words[:min(n, len(words))])
-	leading[0] = first
+	leading := words[:min(n, len(words))]
 	return fmt.Errorf("not on allowlist: %s", strings.Join(leading, " "))
+}
+
+// basename is the last path element of s, or s unchanged when it has none.
+func basename(s string) string {
+	return s[strings.LastIndex(s, "/")+1:]
 }

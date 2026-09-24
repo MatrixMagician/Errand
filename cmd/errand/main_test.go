@@ -555,7 +555,8 @@ func TestAllowMatchingRules(t *testing.T) {
 	p := t.TempDir() + "/config.toml"
 	body := "[defaults]\n" +
 		"allow_commands = [\"ps\", \"grep\", \"systemctl status\", \"systemctl is-active\", \"cat\", \"ls\"]\n" +
-		"\n[hosts.h]\nhostname = \"h\"\n"
+		"\n[hosts.h]\nhostname = \"h\"\n" +
+		"\n[hosts.path]\nhostname = \"path\"\nallow_commands = [\"/usr/bin/df\"]\n"
 	if err := os.WriteFile(p, []byte(body), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -569,7 +570,7 @@ func TestAllowMatchingRules(t *testing.T) {
 	}{
 		{name: "pipeline of listed commands", args: []string{"run", "h", "--", "ps", "aux", "|", "grep", "nginx"}},
 		{name: "multi-word entry", args: []string{"run", "h", "--", "systemctl", "status", "nginx"}},
-		{name: "basename strips the path", args: []string{"run", "h", "--", "/usr/bin/cat", "/etc/hosts"}},
+		{name: "path entry matches only that exact path", args: []string{"run", "path", "--", "/usr/bin/df", "-h"}},
 		{name: "double-quoted pipe is text", args: []string{"run", "h", "--", "grep", `"a|b"`, "file"}},
 		{name: "single-quoted redirection is text", args: []string{"run", "h", "--", "grep", "'x > y'", "file"}},
 		{name: "single-quoted space is text", args: []string{"run", "h", "--", "cat", "'a b'"}},
@@ -580,7 +581,10 @@ func TestAllowMatchingRules(t *testing.T) {
 
 		{name: "unlisted second word", args: []string{"run", "h", "--", "systemctl", "restart", "nginx"}, code: 1, stdout: "not on allowlist: systemctl restart\n"},
 		{name: "too few words for any entry", args: []string{"run", "h", "--", "systemctl"}, code: 1, stdout: "not on allowlist: systemctl\n"},
-		{name: "unlisted command with a path", args: []string{"run", "h", "--", "/sbin/reboot", "now"}, code: 1, stdout: "not on allowlist: reboot\n"},
+		{name: "unlisted command with a path", args: []string{"run", "h", "--", "/sbin/reboot", "now"}, code: 1, stdout: "not on allowlist: /sbin/reboot\n"},
+		{name: "relative path does not match a basename entry", args: []string{"run", "h", "--", "./cat", "a"}, code: 1, stdout: "not on allowlist: ./cat\n"},
+		{name: "absolute path does not match a basename entry", args: []string{"run", "h", "--", "/tmp/evil/cat", "a"}, code: 1, stdout: "not on allowlist: /tmp/evil/cat\n"},
+		{name: "a path entry does not match the bare command", args: []string{"run", "path", "--", "df"}, code: 1, stdout: "not on allowlist: df\n"},
 		{name: "unlisted second segment", args: []string{"run", "h", "--", "ps", "aux", "|", "reboot"}, code: 1, stdout: "not on allowlist: reboot\n"},
 		{name: "output redirection", args: []string{"run", "h", "--", "cat", "a", ">", "b"}, code: 1, stdout: "redirection\n"},
 		{name: "append redirection", args: []string{"run", "h", "--", "cat", "a", ">>", "b"}, code: 1, stdout: "redirection\n"},

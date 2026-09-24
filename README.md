@@ -247,7 +247,7 @@ allow_commands = [
 
 ### What passes
 
-An entry is one or more words. `cat` matches any invocation of `cat`. `systemctl status` matches `systemctl status nginx` and not `systemctl restart nginx`. Words match exactly; there are no globs and no regular expressions. The first word of a command is compared by its last path element, so `/usr/bin/cat` matches `cat`.
+An entry is one or more words. `cat` matches any invocation of `cat`. `systemctl status` matches `systemctl status nginx` and not `systemctl restart nginx`. Words match exactly; there are no globs and no regular expressions. The first word is matched exactly too, on both sides: `cat` matches only `cat`, resolved through the remote `PATH`, and an entry with a path such as `/usr/bin/df` matches only that exact path, never the bare `df`. A path in the command never stands in for a bare entry either, so `./cat` and `/tmp/evil/cat` both fail even when `cat` is listed. `sudo` is the one exception: it is still caught by basename, so `/usr/bin/sudo` is refused the same as `sudo`.
 
 The command judged is the string `run` would send, split into words the way a POSIX shell does it: single quotes, double quotes, and backslashes are honoured, so a `|` inside quotes is text. The words are split into pipeline segments on each unquoted `|`, and every segment has to start with a listed entry. `ps aux | grep nginx` passes with `ps` and `grep` listed. `cat x | sh` does not.
 
