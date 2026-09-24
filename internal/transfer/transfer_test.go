@@ -3,14 +3,17 @@ package transfer
 import (
 	"errors"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"regexp"
 	"strings"
+	"syscall"
 	"testing"
 	"testing/iotest"
 	"time"
 
+	"github.com/MatrixMagician/Errand/internal/result"
 	"github.com/MatrixMagician/Errand/internal/sshtest"
 	"github.com/pkg/sftp"
 	"golang.org/x/crypto/ssh"
@@ -50,6 +53,35 @@ func TestLocalTempNameIsAHiddenUnpredictableSiblingOfTheDestination(t *testing.T
 		if !ok || !suffix.MatchString(rest) {
 			t.Errorf("localTempName(%q) = %q, want %s.errand-<16 hex>", tc.local, got, tc.prefix)
 		}
+	}
+}
+
+// TestTransferErrScoresWhatTheCallerCanFix separates the answers a caller acts
+// on: a path that is missing, forbidden, or grew past the cap is theirs to fix
+// (250), and only a connection that failed under the copy is worth a retry (253).
+func TestTransferErrScoresWhatTheCallerCanFix(t *testing.T) {
+	_, grew := copyCapped(io.Discard, strings.NewReader("xx"), 1)
+	for _, tc := range []struct {
+		name string
+		err  error
+		want result.Phase
+	}{
+		{"remote missing", os.ErrNotExist, result.Usage},
+		{"remote forbidden", os.ErrPermission, result.Usage},
+		{"remote missing, unnormalised", &sftp.StatusError{Code: uint32(sftp.ErrSSHFxNoSuchFile)}, result.Usage},
+		{"remote forbidden, unnormalised", &sftp.StatusError{Code: uint32(sftp.ErrSSHFxPermissionDenied)}, result.Usage},
+		{"local forbidden", &fs.PathError{Op: "open", Path: "/x", Err: syscall.EACCES}, result.Usage},
+		{"source grew past the cap", grew, result.Usage},
+		{"connection lost", sftp.ErrSSHFxConnectionLost, result.Transfer},
+		{"stream cut", io.ErrUnexpectedEOF, result.Transfer},
+		{"server failure", &sftp.StatusError{Code: uint32(sftp.ErrSSHFxFailure)}, result.Transfer},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var got *result.Error
+			if !errors.As(transferErr("h", tc.err), &got) || got.Phase != tc.want {
+				t.Errorf("transferErr(%v) = %v, want phase %v", tc.err, got, tc.want)
+			}
+		})
 	}
 }
 
