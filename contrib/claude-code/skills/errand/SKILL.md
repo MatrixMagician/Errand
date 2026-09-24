@@ -5,7 +5,7 @@ description: Run commands and move files on a remote host through errand, never 
 
 # Errand
 
-`errand` is the only way from this machine to another one. `ssh`, `scp`, `sftp`, and `rsync` are denied here.
+`errand` is the only way from this machine to another one. `ssh`, `scp`, `sftp`, and `rsync` are steered away by a prefix deny rule, not blocked outright; the remote `command=` key is the only hard gate.
 
 ## First, find out what you may reach
 
