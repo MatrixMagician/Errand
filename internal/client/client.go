@@ -5,11 +5,13 @@ package client
 import (
 	"bytes"
 	"context"
+	"crypto/ed25519"
 	"errors"
 	"fmt"
 	"net"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -67,7 +69,7 @@ func dial(ctx context.Context, h config.Host, diag Diag) (*Conn, error) {
 	addr := net.JoinHostPort(h.Hostname, strconv.Itoa(h.Port))
 	start := time.Now()
 
-	verify, err := hostKeyPolicy(h, diag)
+	verify, recorded, err := hostKeyPolicy(h, diag)
 	if err != nil {
 		return nil, err
 	}
@@ -92,8 +94,9 @@ func dial(ctx context.Context, h config.Host, diag Diag) (*Conn, error) {
 	}
 	state.phase = result.Connect
 	cfg := &ssh.ClientConfig{
-		User: h.User,
-		Auth: methods,
+		User:              h.User,
+		Auth:              methods,
+		HostKeyAlgorithms: preferring(recorded(addr, raw.RemoteAddr())),
 		HostKeyCallback: func(_ string, remote net.Addr, key ssh.PublicKey) error {
 			state.Lock()
 			defer state.Unlock()
@@ -203,30 +206,34 @@ func authError(err error, methods int) error {
 
 // hostKeyPolicy is the whole of SPEC §8 for one host. A configured pin replaces
 // known_hosts outright, accept_new may record a key known_hosts has never seen,
-// and nothing may accept a key that changed.
-func hostKeyPolicy(h config.Host, diag Diag) (ssh.HostKeyCallback, error) {
+// and nothing may accept a key that changed. The second result lists the key
+// types already recorded for a host, which negotiation must prefer: a server
+// with several host keys otherwise offers one of a type nobody recorded.
+func hostKeyPolicy(h config.Host, diag Diag) (ssh.HostKeyCallback, func(addr string, remote net.Addr) []string, error) {
 	if h.HostKey != "" {
 		pin, _, _, _, err := ssh.ParseAuthorizedKey([]byte(h.HostKey))
 		if err != nil {
-			return nil, result.Resolve.Wrap(h.Alias, fmt.Errorf("host_key: %w", err))
+			return nil, nil, result.Resolve.Wrap(h.Alias, fmt.Errorf("host_key: %w", err))
 		}
 		return func(addr string, _ net.Addr, key ssh.PublicKey) error {
-			if bytes.Equal(key.Marshal(), pin.Marshal()) {
-				return nil
-			}
-			return pinMismatch(addr, key, pin)
-		}, nil
+				if bytes.Equal(key.Marshal(), pin.Marshal()) {
+					return nil
+				}
+				return pinMismatch(addr, key, pin)
+			}, func(string, net.Addr) []string {
+				return []string{pin.Type()}
+			}, nil
 	}
 
 	check, err := knownHostsCheck(h.KnownHosts)
 	if err != nil {
-		return nil, result.HostKey.Wrap(h.Alias, err)
+		return nil, nil, result.HostKey.Wrap(h.Alias, err)
 	}
 	unknown := unknownKey
 	if h.AcceptNew {
 		unknown = func(addr string, key ssh.PublicKey) error { return trustNew(h.KnownHosts, addr, key, diag) }
 	}
-	return func(addr string, remote net.Addr, key ssh.PublicKey) error {
+	verify := func(addr string, remote net.Addr, key ssh.PublicKey) error {
 		err := check(addr, remote, key)
 		var ke *knownhosts.KeyError
 		switch {
@@ -237,8 +244,51 @@ func hostKeyPolicy(h config.Host, diag Diag) (ssh.HostKeyCallback, error) {
 		case len(ke.Want) == 0:
 			return unknown(addr, key)
 		}
-		return changedKey(addr, key, ke.Want[0])
-	}, nil
+		for _, want := range ke.Want {
+			if want.Key.Type() == key.Type() {
+				return changedKey(addr, key, want)
+			}
+		}
+		if h.AcceptNew {
+			return unknown(addr, key)
+		}
+		return otherKeyType(addr, key, ke.Want)
+	}
+	recorded := func(addr string, remote net.Addr) []string {
+		var ke *knownhosts.KeyError
+		if !errors.As(check(addr, remote, probeKey), &ke) {
+			return nil
+		}
+		var types []string
+		for _, want := range ke.Want {
+			types = append(types, want.Key.Type())
+		}
+		return types
+	}
+	return verify, recorded, nil
+}
+
+// probeKey matches no real host, so checking it against known_hosts lists
+// every key recorded for the host in the resulting KeyError.
+var probeKey, _ = ssh.NewPublicKey(ed25519.PublicKey(make([]byte, ed25519.PublicKeySize)))
+
+// preferring orders every host key algorithm x/crypto offers by default so the
+// ones for the recorded key types come first. The rest stay: a server that
+// has none of them must still get as far as the host key check, which says
+// what is wrong. Nil keeps x/crypto's own order.
+func preferring(types []string) []string {
+	if len(types) == 0 {
+		return nil
+	}
+	all := append(ssh.SupportedAlgorithms().HostKeys, ssh.InsecureAlgorithms().HostKeys...)
+	isRecorded := func(algo string) bool {
+		if algo == ssh.KeyAlgoRSASHA256 || algo == ssh.KeyAlgoRSASHA512 {
+			algo = ssh.KeyAlgoRSA
+		}
+		return slices.Contains(types, algo)
+	}
+	first := slices.DeleteFunc(slices.Clone(all), func(a string) bool { return !isRecorded(a) })
+	return append(first, slices.DeleteFunc(all, isRecorded)...)
 }
 
 // knownHostsCheck reads the files that are there and skips the ones that are
@@ -305,6 +355,16 @@ func unknownKey(addr string, key ssh.PublicKey) error {
 	return fmt.Errorf("unknown host key for %s (%s %s); add to known_hosts: %s",
 		knownhosts.Normalize(addr), key.Type(), ssh.FingerprintSHA256(key),
 		knownhosts.Line([]string{addr}, key))
+}
+
+func otherKeyType(addr string, key ssh.PublicKey, want []knownhosts.KnownKey) error {
+	recorded := make([]string, len(want))
+	for i, w := range want {
+		recorded[i] = w.Key.Type()
+	}
+	return fmt.Errorf("no recorded %s host key for %s (known_hosts has %s); server offered %s; add it to known_hosts: %s",
+		key.Type(), knownhosts.Normalize(addr), strings.Join(slices.Compact(recorded), ", "),
+		ssh.FingerprintSHA256(key), knownhosts.Line([]string{addr}, key))
 }
 
 func changedKey(addr string, key ssh.PublicKey, want knownhosts.KnownKey) error {

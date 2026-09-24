@@ -2,7 +2,9 @@ package client
 
 import (
 	"context"
+	"crypto/ecdsa"
 	"crypto/ed25519"
+	"crypto/elliptic"
 	"crypto/rand"
 	"fmt"
 	"net"
@@ -41,7 +43,7 @@ func TestHostKeyPolicyPinIgnoresKnownHosts(t *testing.T) {
 	server, other := testKey(t), testKey(t)
 	h := config.Host{Alias: "h", HostKey: authorized(server), KnownHosts: []string{"/nonexistent/known_hosts"}}
 
-	verify, err := hostKeyPolicy(h, nil)
+	verify, _, err := hostKeyPolicy(h, nil)
 	if err != nil {
 		t.Fatalf("hostKeyPolicy: %v", err)
 	}
@@ -54,7 +56,7 @@ func TestHostKeyPolicyPinIgnoresKnownHosts(t *testing.T) {
 	}
 
 	h.HostKey = "not-a-key"
-	_, err = hostKeyPolicy(h, nil)
+	_, _, err = hostKeyPolicy(h, nil)
 	if err == nil || !strings.Contains(err.Error(), "resolve: host_key:") {
 		t.Errorf("a malformed pin gave %v, want a resolve error", err)
 	}
@@ -64,7 +66,7 @@ func TestHostKeyPolicyAcceptNewRecordsTheKey(t *testing.T) {
 	key := testKey(t)
 	path := filepath.Join(t.TempDir(), "ssh", "known_hosts")
 	var notes []string
-	verify, err := hostKeyPolicy(
+	verify, _, err := hostKeyPolicy(
 		config.Host{Alias: "h", AcceptNew: true, KnownHosts: []string{path}},
 		func(format string, args ...any) { notes = append(notes, fmt.Sprintf(format, args...)) },
 	)
@@ -91,6 +93,41 @@ func TestHostKeyPolicyAcceptNewRecordsTheKey(t *testing.T) {
 	}
 	if len(notes) != 1 || !strings.Contains(notes[0], "accept_new") {
 		t.Errorf("diagnostics = %q, want one accept_new note", notes)
+	}
+}
+
+// TestHostKeyPolicyOtherKeyTypeIsNotAChange covers a server that offers a key
+// of a type known_hosts has no entry for. That is not evidence of a changed
+// key, so it must not read as one, and without accept_new it is not trusted.
+func TestHostKeyPolicyOtherKeyTypeIsNotAChange(t *testing.T) {
+	const addr = "127.0.0.1:2222"
+	recorded := testKey(t)
+	priv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	offered, err := ssh.NewPublicKey(&priv.PublicKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	kh := filepath.Join(t.TempDir(), "known_hosts")
+	if err := os.WriteFile(kh, []byte(knownhosts.Line([]string{addr}, recorded)+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	verify, _, err := hostKeyPolicy(config.Host{Alias: "h", KnownHosts: []string{kh}}, nil)
+	if err != nil {
+		t.Fatalf("hostKeyPolicy: %v", err)
+	}
+	err = verify(addr, &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 2222}, offered)
+	if err == nil {
+		t.Fatal("a key of an unrecorded type was accepted without accept_new")
+	}
+	if strings.Contains(err.Error(), "changed") {
+		t.Errorf("an unrecorded key type gave %q, want no claim that the key changed", err)
+	}
+	if want := "no recorded ecdsa-sha2-nistp256 host key"; !strings.Contains(err.Error(), want) {
+		t.Errorf("error = %q, want it to say %q", err, want)
 	}
 }
 
