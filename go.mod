@@ -4,7 +4,7 @@ go 1.26.8
 
 require (
 	github.com/BurntSushi/toml v1.6.0
-	github.com/pkg/sftp v1.13.9
+	github.com/pkg/sftp v1.13.11
 )
 
 require github.com/kr/fs v0.1.0 // indirect
