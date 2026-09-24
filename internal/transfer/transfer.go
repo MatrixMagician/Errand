@@ -45,6 +45,10 @@ func Put(ctx context.Context, c *client.Conn, local, remote string, mode fs.File
 		r.Err = result.Usage.Wrap(alias, fmt.Errorf("%s is a directory, and put moves one file", local))
 		return r
 	}
+	if !fi.Mode().IsRegular() {
+		r.Err = result.Usage.Wrap(alias, fmt.Errorf("%s is not a regular file, so its size says nothing about its length", local))
+		return r
+	}
 	if maxSize > 0 && fi.Size() > maxSize {
 		r.Err = result.Usage.Wrap(alias, fmt.Errorf("%s is %d bytes, over --max-size %d", local, fi.Size(), maxSize))
 		return r
@@ -65,7 +69,7 @@ func Put(ctx context.Context, c *client.Conn, local, remote string, mode fs.File
 
 	tmp := tempName(remote)
 	return move(ctx, c, r.Command, early,
-		func() (int64, error) { return upload(sc, src, tmp, remote, mode) },
+		func() (int64, error) { return upload(sc, src, tmp, remote, mode, maxSize) },
 		func() { _ = sc.Remove(tmp) })
 }
 
@@ -103,6 +107,10 @@ func Get(ctx context.Context, c *client.Conn, remote, local string, maxSize int6
 		r.Err = result.Transfer.Wrap(alias, fmt.Errorf("%s is a directory, and get moves one file", remote))
 		return r
 	}
+	if !fi.Mode().IsRegular() {
+		r.Err = result.Usage.Wrap(alias, fmt.Errorf("%s is not a regular file, so its size says nothing about its length", remote))
+		return r
+	}
 	if maxSize > 0 && fi.Size() > maxSize {
 		r.Err = result.Usage.Wrap(alias, fmt.Errorf("%s is %d bytes, over --max-size %d", remote, fi.Size(), maxSize))
 		return r
@@ -116,7 +124,7 @@ func Get(ctx context.Context, c *client.Conn, remote, local string, maxSize int6
 
 	tmp := localTempName(local)
 	return move(ctx, c, r.Command, early,
-		func() (int64, error) { return download(src, tmp, local) },
+		func() (int64, error) { return download(src, tmp, local, maxSize) },
 		func() { _ = os.Remove(tmp) })
 }
 
@@ -184,12 +192,12 @@ func localTempName(local string) string {
 	return filepath.Join(filepath.Dir(local), "."+filepath.Base(local)+".errand-"+strconv.Itoa(os.Getpid()))
 }
 
-func upload(sc *sftp.Client, src io.Reader, tmp, remote string, mode fs.FileMode) (int64, error) {
+func upload(sc *sftp.Client, src io.Reader, tmp, remote string, mode fs.FileMode, maxSize int64) (int64, error) {
 	w, err := sc.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC)
 	if err != nil {
 		return 0, err
 	}
-	n, err := io.Copy(w, src)
+	n, err := copyCapped(w, src, maxSize)
 	if err == nil {
 		err = w.Chmod(mode)
 	}
@@ -205,12 +213,12 @@ func upload(sc *sftp.Client, src io.Reader, tmp, remote string, mode fs.FileMode
 // download writes 0644 before umask, the mode a shell redirect would give the
 // file: the remote bits are the sender's, and carrying them across would let a
 // remote 0777 decide what this machine ends up with.
-func download(src io.Reader, tmp, local string) (int64, error) {
+func download(src io.Reader, tmp, local string, maxSize int64) (int64, error) {
 	w, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
 	if err != nil {
 		return 0, err
 	}
-	n, err := io.Copy(w, src)
+	n, err := copyCapped(w, src, maxSize)
 	if cerr := w.Close(); err == nil {
 		err = cerr
 	}
@@ -218,6 +226,20 @@ func download(src io.Reader, tmp, local string) (int64, error) {
 		return n, err
 	}
 	return n, os.Rename(tmp, local)
+}
+
+// copyCapped enforces --max-size on the bytes themselves, which the stat check
+// cannot: a file that grows during the copy passes the stat and keeps going.
+// One byte past the cap is enough to know it was crossed. A zero cap is none.
+func copyCapped(w io.Writer, src io.Reader, maxSize int64) (int64, error) {
+	if maxSize <= 0 {
+		return io.Copy(w, src)
+	}
+	n, err := io.Copy(w, io.LimitReader(src, maxSize+1))
+	if err == nil && n > maxSize {
+		err = fmt.Errorf("source grew past --max-size %d during the copy", maxSize)
+	}
+	return n, err
 }
 
 // rename puts the finished bytes under their final name with posix-rename,

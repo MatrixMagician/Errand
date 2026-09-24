@@ -1748,24 +1748,39 @@ func TestIntegrationGetInterrupted(t *testing.T) {
 }
 
 // TestIntegrationGetTimeoutBeforeTheCopy puts the hang before the first byte:
-// the remote open of a FIFO with no writer never returns, so only an abort
-// armed before the SFTP requests can end the get inside --timeout.
+// an sftp-server that never answers its init, so only an abort armed before
+// the first SFTP request can end the get inside --timeout. The suite's tests
+// run serially on one container, so swapping the binary touches no other test.
 func TestIntegrationGetTimeoutBeforeTheCopy(t *testing.T) {
 	s := sshtest.Start(t)
 	cfg := trusting(t, s)
-	fifo := remoteDir(t, cfg) + "/fifo"
-	remote(t, cfg, "mkfifo "+fifo)
-	// A writer releases the sftp-server still blocked in open(2).
-	t.Cleanup(func() { errand(t, cfg, "", "run", "h", "--", "timeout 2 sh -c 'echo > "+fifo+"'") })
+	const server = "/usr/lib/ssh/sftp-server"
+	remote(t, cfg, "mv "+server+" "+server+".real && printf '#!/bin/sh\\nexec sleep 3600\\n' > "+server+" && chmod 755 "+server)
+	t.Cleanup(func() { remote(t, cfg, "mv "+server+".real "+server+" && { pkill -x sleep; true; }") })
 
 	down := t.TempDir()
-	code, stderr, took := timed(t, cfg, "get", "h", "--timeout", "500ms", fifo, filepath.Join(down, "file"))
+	code, stderr, took := timed(t, cfg, "get", "h", "--timeout", "500ms", "/etc/hostname", filepath.Join(down, "file"))
 	if code != 254 || !strings.Contains(stderr, "timeout") {
 		t.Errorf("code=%d stderr=%q, want 254 and a timeout diagnostic", code, stderr)
 	}
 	// The 500ms budget, then the 2s abort grace, with slack for connecting.
 	if took > 4*time.Second {
-		t.Errorf("took %v: the get waited on a remote open that never returns", took)
+		t.Errorf("took %v: the get waited on an SFTP reply that never comes", took)
+	}
+	if got := entries(t, down); len(got) != 0 {
+		t.Errorf("destination directory holds %q, want nothing", got)
+	}
+}
+
+// TestIntegrationGetDevZeroIsRefused is the source whose stat size says nothing
+// about its length: /dev/zero stats at 0 bytes and never ends.
+func TestIntegrationGetDevZeroIsRefused(t *testing.T) {
+	s := sshtest.Start(t)
+	cfg := trusting(t, s)
+	down := t.TempDir()
+	code, stderr, _ := timed(t, cfg, "get", "h", "--max-size", "1KiB", "--timeout", "10s", "/dev/zero", filepath.Join(down, "file"))
+	if code != 250 || !strings.Contains(stderr, "not a regular file") {
+		t.Errorf("code=%d stderr=%q, want 250 and a non-regular-file usage error", code, stderr)
 	}
 	if got := entries(t, down); len(got) != 0 {
 		t.Errorf("destination directory holds %q, want nothing", got)

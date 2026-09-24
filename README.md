@@ -111,7 +111,7 @@ errand run web-prod -- 'ls /etc | head -n 3'
 
 | Flag | Default | Meaning |
 |---|---|---|
-| `--max-size <bytes>` | `64MiB` | Reject a larger source file before the transfer starts. `0` disables it. |
+| `--max-size <bytes>` | `64MiB` | Reject a larger source file before the transfer starts, and fail a transfer whose source grows past it. `0` disables it. |
 | `--mode <octal>` | `0644` | `put` only. Permission bits for the remote file. |
 | `--timeout <dur>` | `120s`, or the host's `timeout` | As for `run`. |
 | `--connect-timeout <dur>` | `10s` | As for `run`. |
@@ -137,7 +137,7 @@ When the remote command ran to completion, `errand` exits with its exit code, wh
 
 | Code | Meaning |
 |---|---|
-| 250 | Usage error, unknown alias, or configuration error. Also a transfer source that is missing, a directory, or over `--max-size`. |
+| 250 | Usage error, unknown alias, or configuration error. Also a transfer source that is missing, a directory, not a regular file, or over `--max-size`. |
 | 251 | Host key verification failed: unknown, changed, or not matching the configured pin. |
 | 252 | Authentication failed. |
 | 253 | Network failure: DNS, connection refused, handshake, connection lost mid-command, or an SFTP error such as a missing remote file. |
@@ -362,7 +362,7 @@ errand get web-prod /tmp/restart.sh restart.copy
 
 `put` writes to `.<name>.errand-<pid>` in the destination directory and renames it into place, so a partial upload never appears under the final name. `get` does the same in the local destination directory. A timeout or an interrupt removes the temporary file when the connection can still carry the request. The final name never appears either way.
 
-`--max-size` is checked against the source file before any bytes move. A source over the limit, a missing local source, a local directory as `put`'s source, or a missing local destination directory for `get` is a usage error, exit 250. A remote directory as `get`'s source is an SFTP error, exit 253. `put` sets the remote permission bits from `--mode`. `get` writes the local file `0644` before your umask, whatever the remote bits were.
+`--max-size` is checked against the source file before any bytes move, and again as they move: a source that grows past the limit mid-copy fails with exit 253 and nothing appears under the final name. A source over the limit, a source that is not a regular file (such as `/dev/zero` or a FIFO), a missing local source, a local directory as `put`'s source, or a missing local destination directory for `get` is a usage error, exit 250. A remote directory as `get`'s source is an SFTP error, exit 253. `put` sets the remote permission bits from `--mode`. `get` writes the local file `0644` before your umask, whatever the remote bits were.
 
 To move a directory tree, tar on one side and untar on the other. That also compresses:
 
