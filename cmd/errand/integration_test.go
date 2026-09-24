@@ -17,6 +17,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -406,7 +407,7 @@ func TestIntegrationPutInterruptedTransportFrozen(t *testing.T) {
 	if err := cmd.Start(); err != nil {
 		t.Fatal(err)
 	}
-	time.Sleep(300 * time.Millisecond)
+	<-p.forwarded // wait for real transfer bytes in flight, not a guessed delay
 	p.Freeze()
 	start := time.Now()
 	err := cmd.Wait()
@@ -589,12 +590,20 @@ func TestIntegrationRunPerHostTimeout(t *testing.T) {
 	}
 }
 
+// primeBytes is comfortably more than a fresh session's handshake, auth, and
+// sftp init traffic, so forwarded fires only once real transfer bytes are
+// in flight client->server, not merely protocol bytes.
+const primeBytes = 64 << 10
+
 // freezingProxy forwards one TCP connection to addr until Freeze, then goes
 // silent in both directions. It never closes the frozen connection: that a
-// hung peer stays open is exactly what teardown has to survive.
+// hung peer stays open is exactly what teardown has to survive. forwarded
+// closes once primeBytes have been relayed client->server, the signal a
+// caller waits on instead of guessing how long bytes take to reach flight.
 type freezingProxy struct {
-	Port   int
-	frozen chan struct{}
+	Port      int
+	frozen    chan struct{}
+	forwarded chan struct{}
 }
 
 func newFreezingProxy(t *testing.T, addr string) *freezingProxy {
@@ -604,7 +613,7 @@ func newFreezingProxy(t *testing.T, addr string) *freezingProxy {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = l.Close() })
-	p := &freezingProxy{Port: l.Addr().(*net.TCPAddr).Port, frozen: make(chan struct{})}
+	p := &freezingProxy{Port: l.Addr().(*net.TCPAddr).Port, frozen: make(chan struct{}), forwarded: make(chan struct{})}
 	go func() {
 		down, err := l.Accept()
 		if err != nil {
@@ -615,15 +624,25 @@ func newFreezingProxy(t *testing.T, addr string) *freezingProxy {
 			_ = down.Close()
 			return
 		}
-		go p.pipe(down, up)
-		go p.pipe(up, down)
+		go p.pipe(down, up, nil)
+		var sent int
+		var once sync.Once
+		go p.pipe(up, down, func(n int) {
+			sent += n
+			if sent >= primeBytes {
+				once.Do(func() { close(p.forwarded) })
+			}
+		})
 	}()
 	return p
 }
 
 func (p *freezingProxy) Freeze() { close(p.frozen) }
 
-func (p *freezingProxy) pipe(dst, src net.Conn) {
+// pipe relays src to dst until Freeze or either side closes. onForward, when
+// set, is called after each successful write with the byte count relayed;
+// pipe calls it from a single goroutine, so it needs no locking of its own.
+func (p *freezingProxy) pipe(dst, src net.Conn, onForward func(n int)) {
 	buf := make([]byte, 32*1024)
 	for {
 		n, err := src.Read(buf)
@@ -635,6 +654,9 @@ func (p *freezingProxy) pipe(dst, src net.Conn) {
 		if n > 0 {
 			if _, err := dst.Write(buf[:n]); err != nil {
 				return
+			}
+			if onForward != nil {
+				onForward(n)
 			}
 		}
 		if err != nil {
