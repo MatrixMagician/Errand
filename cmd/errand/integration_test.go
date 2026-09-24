@@ -173,10 +173,11 @@ func TestIntegrationRunUnknownHostKey(t *testing.T) {
 	if stdout != "" {
 		t.Errorf("diagnostics leaked into stdout: %q", stdout)
 	}
-	for _, want := range []string{"SHA256:", s.KnownHostsLine()} {
-		if !strings.Contains(stderr, want) {
-			t.Errorf("stderr missing %q:\n%s", want, stderr)
-		}
+	if !strings.Contains(stderr, "SHA256:") {
+		t.Errorf("stderr missing a fingerprint:\n%s", stderr)
+	}
+	if !strings.Contains(stderr, s.KnownHostsLine()) && !strings.Contains(stderr, s.RSAKnownHostsLine()) {
+		t.Errorf("stderr missing a known_hosts line for either host key:\n%s", stderr)
 	}
 }
 
@@ -219,8 +220,8 @@ func TestIntegrationRunAcceptNew(t *testing.T) {
 		t.Fatalf("code=%d, want 0 with an accept_new note; stderr=%q", code, stderr)
 	}
 	recorded := readFile(t, kh)
-	if want := s.KnownHostsLine() + "\n"; recorded != want {
-		t.Errorf("known_hosts = %q, want %q", recorded, want)
+	if recorded != s.KnownHostsLine()+"\n" && recorded != s.RSAKnownHostsLine()+"\n" {
+		t.Errorf("known_hosts = %q, want the line for one of the server's host keys", recorded)
 	}
 
 	// The key is known now, so the second run is an ordinary trusting run.
@@ -457,10 +458,11 @@ func TestIntegrationRawDial(t *testing.T) {
 
 func dial(s *sshtest.Server, key sshtest.Key) (*ssh.Client, error) {
 	return ssh.Dial("tcp", s.Addr, &ssh.ClientConfig{
-		User:            "root",
-		Auth:            []ssh.AuthMethod{ssh.PublicKeys(key.Signer)},
-		HostKeyCallback: ssh.FixedHostKey(s.HostKey),
-		Timeout:         10 * time.Second,
+		User:              "root",
+		Auth:              []ssh.AuthMethod{ssh.PublicKeys(key.Signer)},
+		HostKeyCallback:   ssh.FixedHostKey(s.HostKey),
+		HostKeyAlgorithms: []string{s.HostKey.Type()},
+		Timeout:           10 * time.Second,
 	})
 }
 
@@ -788,6 +790,22 @@ func TestIntegrationRunQuiet(t *testing.T) {
 	code, _, stderr = errand(t, trusting(t, s), "", "run", "h", "--quiet", "--", "echo err >&2")
 	if code != 0 || stderr != "err\n" {
 		t.Errorf("remote stderr: code=%d stderr=%q, want 0 and %q", code, stderr, "err\n")
+	}
+}
+
+// TestIntegrationCheckNegotiatesTheRecordedKeyType covers a server with both an
+// RSA and an ed25519 host key where known_hosts records only one of them, as
+// ssh-keyscan -t does. Negotiation has to pick the recorded type in either
+// direction, or the other key reads as a changed one.
+func TestIntegrationCheckNegotiatesTheRecordedKeyType(t *testing.T) {
+	s := sshtest.Start(t)
+	for _, line := range []string{s.KnownHostsLine(), s.RSAKnownHostsLine()} {
+		t.Run(strings.Fields(line)[1], func(t *testing.T) {
+			code, _, stderr := errand(t, writeConfig(t, s, hostConfig{knownHosts: line + "\n"}), "", "check", "h")
+			if code != 0 {
+				t.Errorf("code=%d, want 0; stderr=%q", code, stderr)
+			}
+		})
 	}
 }
 

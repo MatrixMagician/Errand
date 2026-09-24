@@ -6,6 +6,7 @@ package sshtest
 import (
 	"crypto/ed25519"
 	"crypto/rand"
+	"crypto/rsa"
 	"encoding/pem"
 	"fmt"
 	"net"
@@ -31,6 +32,7 @@ type Server struct {
 	Addr        string
 	Port        int
 	HostKey     ssh.PublicKey
+	RSAHostKey  ssh.PublicKey
 	ClientKey   Key
 	RejectedKey Key
 	Dir         string
@@ -45,6 +47,11 @@ type Server struct {
 // KnownHostsLine is the known_hosts entry that matches the server.
 func (s *Server) KnownHostsLine() string {
 	return knownHostsLine(s.Addr, s.HostKey)
+}
+
+// RSAKnownHostsLine is the known_hosts entry for the server's other host key.
+func (s *Server) RSAKnownHostsLine() string {
+	return knownHostsLine(s.Addr, s.RSAHostKey)
 }
 
 // WrongKnownHostsLine is a known_hosts entry for the server's address carrying
@@ -104,6 +111,22 @@ func newKey(dir, name string) (Key, error) {
 		return Key{}, err
 	}
 	return Key{Signer: signer, Public: sshPub, Path: path}, nil
+}
+
+// newRSAKey writes an RSA private key to dir/name and returns its public half.
+func newRSAKey(dir, name string) (ssh.PublicKey, error) {
+	priv, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		return nil, err
+	}
+	block, err := ssh.MarshalPrivateKey(priv, "")
+	if err != nil {
+		return nil, err
+	}
+	if err := os.WriteFile(filepath.Join(dir, name), pem.EncodeToMemory(block), 0o600); err != nil {
+		return nil, err
+	}
+	return ssh.NewPublicKey(&priv.PublicKey)
 }
 
 var binaryOnce = sync.OnceValues(buildBinary)

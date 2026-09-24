@@ -25,8 +25,11 @@ const (
 	readyFor = 60 * time.Second
 )
 
+// The RSA host key is there so the server offers a second key type, as real
+// servers do: every known_hosts the suite writes records only the ed25519 key.
 const sshdConfig = `Port 22
 HostKey /etc/errand/host_key
+HostKey /etc/errand/host_key_rsa
 AuthorizedKeysFile /etc/errand/authorized_keys
 PasswordAuthentication no
 KbdInteractiveAuthentication no
@@ -120,6 +123,9 @@ func writeServerFiles(s *Server) error {
 		return err
 	}
 	s.HostKey = host.Public
+	if s.RSAHostKey, err = newRSAKey(s.Dir, "host_key_rsa"); err != nil {
+		return err
+	}
 	if s.ClientKey, err = newKey(s.Dir, "client_key"); err != nil {
 		return err
 	}
