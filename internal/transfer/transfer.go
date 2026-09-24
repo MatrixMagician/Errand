@@ -197,15 +197,16 @@ func download(src io.Reader, tmp, local string) (int64, error) {
 	return n, os.Rename(tmp, local)
 }
 
-// rename puts the finished bytes under their final name. posix-rename replaces
-// an existing destination in one step; without the extension the destination
-// has to go first, which is the one moment a reader can see neither file.
+// rename puts the finished bytes under their final name with posix-rename,
+// which replaces an existing destination in one step. A server without the
+// extension is refused rather than emulated: remove-then-rename would leave a
+// moment with neither file, and pkg/sftp's Remove also removes an empty
+// directory standing at the destination.
 func rename(sc *sftp.Client, tmp, remote string) error {
-	if _, ok := sc.HasExtension("posix-rename@openssh.com"); ok {
-		return sc.PosixRename(tmp, remote)
+	if _, ok := sc.HasExtension("posix-rename@openssh.com"); !ok {
+		return fmt.Errorf("server lacks the posix-rename@openssh.com extension, so %s cannot be replaced atomically", remote)
 	}
-	_ = sc.Remove(remote)
-	return sc.Rename(tmp, remote)
+	return sc.PosixRename(tmp, remote)
 }
 
 // abandon unlinks the temp file while the connection is still up, then takes

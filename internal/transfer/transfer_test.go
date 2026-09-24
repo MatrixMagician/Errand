@@ -10,6 +10,8 @@ import (
 	"strings"
 	"testing"
 	"testing/iotest"
+
+	"github.com/pkg/sftp"
 )
 
 func TestTempNameIsAHiddenSiblingOfTheDestination(t *testing.T) {
@@ -69,5 +71,53 @@ func TestDownloadCutPartwayNeverReachesTheFinalName(t *testing.T) {
 	}
 	if _, err := os.Stat(tmp); err != nil {
 		t.Errorf("stat %s = %v, want the partial bytes under the temporary name", tmp, err)
+	}
+}
+
+// TestRenameWithoutPosixRenameLeavesTheDestinationAlone pins the one rename
+// path: a server that lacks posix-rename gets an error, never a remove-then-
+// rename that would take an empty directory standing at the destination.
+func TestRenameWithoutPosixRenameLeavesTheDestinationAlone(t *testing.T) {
+	if err := sftp.SetSFTPExtensions(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = sftp.SetSFTPExtensions("hardlink@openssh.com", "posix-rename@openssh.com", "statvfs@openssh.com")
+	})
+
+	cr, sw := io.Pipe()
+	sr, cw := io.Pipe()
+	srv, err := sftp.NewServer(struct {
+		io.Reader
+		io.WriteCloser
+	}{sr, sw})
+	if err != nil {
+		t.Fatal(err)
+	}
+	go func() { _ = srv.Serve() }()
+	sc, err := sftp.NewClientPipe(cr, cw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = srv.Close()
+		_ = sc.Close()
+	})
+
+	dest := filepath.Join(t.TempDir(), "emptydir")
+	if err := os.Mkdir(dest, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	tmp := tempName(dest)
+	if err := os.WriteFile(tmp, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	err = rename(sc, tmp, dest)
+	if err == nil || !strings.Contains(err.Error(), "posix-rename") {
+		t.Errorf("rename = %v, want an error naming the missing posix-rename extension", err)
+	}
+	if fi, err := os.Stat(dest); err != nil || !fi.IsDir() {
+		t.Errorf("stat %s = %v, %v; want the directory still standing", dest, fi, err)
 	}
 }
