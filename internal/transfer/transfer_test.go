@@ -62,7 +62,7 @@ func TestDownloadCutPartwayNeverReachesTheFinalName(t *testing.T) {
 	tmp := localTempName(local)
 	src := io.MultiReader(strings.NewReader("half"), iotest.ErrReader(errors.New("cut")))
 
-	n, err := download(src, tmp, local)
+	n, err := download(src, tmp, local, 0)
 	if err == nil {
 		t.Fatalf("download copied %d bytes and reported no error", n)
 	}
@@ -71,6 +71,25 @@ func TestDownloadCutPartwayNeverReachesTheFinalName(t *testing.T) {
 	}
 	if _, err := os.Stat(tmp); err != nil {
 		t.Errorf("stat %s = %v, want the partial bytes under the temporary name", tmp, err)
+	}
+}
+
+// TestDownloadPastMaxSizeNeverReachesTheFinalName is a source that grows after
+// its stat said it fit: the copy stops one byte past the cap and the bytes stay
+// under the temporary name.
+func TestDownloadPastMaxSizeNeverReachesTheFinalName(t *testing.T) {
+	local := filepath.Join(t.TempDir(), "file")
+	tmp := localTempName(local)
+
+	n, err := download(strings.NewReader(strings.Repeat("x", 100)), tmp, local, 10)
+	if err == nil || !strings.Contains(err.Error(), "--max-size") {
+		t.Errorf("download = %d, %v; want an error naming --max-size", n, err)
+	}
+	if n != 11 {
+		t.Errorf("download copied %d bytes, want 11: the cap plus the one that proves it was crossed", n)
+	}
+	if _, err := os.Stat(local); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("stat %s = %v, want the final name never to appear", local, err)
 	}
 }
 
