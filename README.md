@@ -251,6 +251,8 @@ An entry is one or more words. `cat` matches any invocation of `cat`. `systemctl
 
 The command judged is the string `run` would send, split into words the way a POSIX shell does it: single quotes, double quotes, and backslashes are honoured, so a `|` inside quotes is text. The words are split into pipeline segments on each unquoted `|`, and every segment has to start with a listed entry. `ps aux | grep nginx` passes with `ps` and `grep` listed. `cat x | sh` does not.
 
+`find`, `xargs`, `env`, `git`, `sh`, `bash`, `python3`, `awk`, `tee`, `perl`, and `ssh` can each run a command of their own choosing. Listing the bare word passes anything they can be told to run, not just the read you had in mind: `find / -exec rm -rf {} \;` and `git -c alias.x='!reboot' x` both pass with `find` and `git` listed. Narrow a wrapper with a word-prefix entry instead, such as `git status` or `git log`.
+
 ### What fails, and the reason `allow` prints
 
 | The command has | Reason on stdout |
@@ -384,7 +386,7 @@ While a command runs, `errand` sends TCP and SSH keepalives every 30 seconds so 
 
 - `errand-allow-hook.py` is a PreToolUse hook on the Bash tool. When the Bash command is one plain `errand` invocation, the hook runs `errand allow` with the same arguments and, on exit 0, tells Claude Code to run it without asking. For any other outcome it prints nothing, and Claude Code prompts as it normally would. The hook never denies and never asks. It needs `python3` and `errand` on `PATH`, and Claude Code runs hooks with the `PATH` of your login shell rather than the terminal's, so install `errand` somewhere standard such as `~/.local/bin`. A hook that cannot find `errand` stays silent, and every command prompts.
 - `skills/errand/SKILL.md` is a skill that fires when SSH, a server, or a remote host comes up. It tells Claude to run `errand hosts` first, write `--` before the command, pass the command as one single-quoted argument, use `--json`, read `status` before `exit_code`, and reach for `errand get` rather than `cat` on a large file. It says nothing about setup; declaring hosts and managing keys stay yours.
-- `settings.json` registers the hook and denies `ssh`, `scp`, `sftp`, and `rsync`, so Errand is the only road out.
+- `settings.json` registers the hook and steers an agent away from `ssh`, `scp`, `sftp`, and `rsync` with a prefix deny rule. A prefix rule matches the start of the command string, not the program it runs, so it does not stop `/usr/bin/ssh ...` or `sh -c 'ssh ...'`; the remote `command=` key under [Hardening the remote side](#hardening-the-remote-side) is the only gate an agent cannot route around.
 
 Install:
 
