@@ -5,6 +5,7 @@ import (
 	"crypto/ed25519"
 	"crypto/rand"
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -13,6 +14,7 @@ import (
 	"time"
 
 	"github.com/MatrixMagician/Errand/internal/config"
+	"github.com/MatrixMagician/Errand/internal/result"
 	"github.com/MatrixMagician/Errand/internal/sshtest"
 	"golang.org/x/crypto/ssh"
 	"golang.org/x/crypto/ssh/knownhosts"
@@ -175,5 +177,74 @@ func TestKeepaliveRequestsKeepFlowing(t *testing.T) {
 	time.Sleep(5 * keepaliveInterval)
 	if grew := sent(); grew != after {
 		t.Errorf("%d keepalives went out after Abort, want the loop stopped", grew-after)
+	}
+}
+
+// TestDialStopsAHungAgent covers an agent that takes the connection and never
+// answers, as a locked 1Password or gpg-agent waiting on a GUI prompt does.
+// The handshake blocks reading the agent socket, not the TCP one, so only
+// closing the agent connection lets the connect budget end it.
+func TestDialStopsAHungAgent(t *testing.T) {
+	s := sshtest.Start(t)
+	dir, err := os.MkdirTemp("", "agent")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	sock := filepath.Join(dir, "sock")
+	l, err := net.Listen("unix", sock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = l.Close() })
+	var held []net.Conn
+	var heldMu sync.Mutex
+	t.Cleanup(func() {
+		heldMu.Lock()
+		defer heldMu.Unlock()
+		for _, c := range held {
+			_ = c.Close()
+		}
+	})
+	go func() {
+		for {
+			c, err := l.Accept()
+			if err != nil {
+				return
+			}
+			heldMu.Lock()
+			held = append(held, c)
+			heldMu.Unlock()
+		}
+	}()
+	t.Setenv("SSH_AUTH_SOCK", sock)
+
+	const budget = 500 * time.Millisecond
+	ctx, cancel := context.WithTimeoutCause(context.Background(), budget, result.ErrTimeout)
+	defer cancel()
+	knownHosts := sshtest.WriteFile(t, t.TempDir(), "known_hosts", s.KnownHostsLine()+"\n")
+	start := time.Now()
+	done := make(chan error, 1)
+	go func() {
+		conn, err := Dial(ctx, config.Host{
+			Alias: "h", Hostname: "127.0.0.1", Port: s.Port, User: "root",
+			KnownHosts: []string{knownHosts},
+		}, nil)
+		if conn != nil {
+			_ = conn.Close()
+		}
+		done <- err
+	}()
+
+	select {
+	case err := <-done:
+		if elapsed := time.Since(start); elapsed > budget+time.Second {
+			t.Errorf("Dial took %v, want within the %v connect budget", elapsed, budget)
+		}
+		if code := (result.Result{Err: err}).ExitCode(); code != 254 {
+			t.Errorf("Dial gave %v (exit %d), want the connect timeout (exit 254)", err, code)
+		}
+	case <-time.After(budget + 3*time.Second):
+		t.Fatal("Dial is still blocked on the hung agent")
 	}
 }

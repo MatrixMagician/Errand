@@ -80,7 +80,7 @@ func dial(ctx context.Context, h config.Host, diag Diag) (*Conn, error) {
 	stop := context.AfterFunc(ctx, func() { _ = raw.Close() })
 	defer stop()
 
-	methods, closeAgent := authMethods(h, diag)
+	methods, closeAgent := authMethods(ctx, h, diag)
 	defer closeAgent()
 
 	// The callback is the only place that knows the handshake got past the
@@ -316,16 +316,20 @@ func changedKey(addr string, key ssh.PublicKey, want knownhosts.KnownKey) error 
 
 // authMethods offers the agent's identities first, then each configured
 // identity file. Nothing ever prompts; unusable identities are noted and
-// skipped so the server still gets a chance to say what it accepts.
-func authMethods(h config.Host, diag Diag) ([]ssh.AuthMethod, func()) {
+// skipped so the server still gets a chance to say what it accepts. The agent
+// connection closes when ctx ends: a hung agent blocks the handshake on its
+// own socket, which closing the TCP connection does not reach.
+func authMethods(ctx context.Context, h config.Host, diag Diag) ([]ssh.AuthMethod, func()) {
 	var methods []ssh.AuthMethod
 	closeAgent := func() {}
 	if sock := os.Getenv("SSH_AUTH_SOCK"); sock != "" {
-		conn, err := net.Dial("unix", sock)
+		var dialer net.Dialer
+		conn, err := dialer.DialContext(ctx, "unix", sock)
 		if err != nil {
 			diag("skipping SSH agent at %s: %v", sock, err)
 		} else {
-			closeAgent = func() { _ = conn.Close() }
+			stop := context.AfterFunc(ctx, func() { _ = conn.Close() })
+			closeAgent = func() { stop(); _ = conn.Close() }
 			methods = append(methods, ssh.PublicKeysCallback(agent.NewClient(conn).Signers))
 		}
 	}
