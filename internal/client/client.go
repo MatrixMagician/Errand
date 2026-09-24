@@ -117,7 +117,7 @@ func dial(ctx context.Context, h config.Host, diag Diag) (*Conn, error) {
 		switch {
 		case state.err != nil:
 			return nil, result.HostKey.Wrap(h.Alias, state.err)
-		case state.phase == result.Auth:
+		case state.phase == result.Auth && authRejected(err):
 			return nil, result.Auth.Wrap(h.Alias, authError(err, len(methods)))
 		}
 		return nil, result.Connect.Wrap(h.Alias, err)
@@ -190,6 +190,16 @@ func (c *Conn) Abort(grace time.Duration) {
 func (c *Conn) Close() error {
 	c.stopKA()
 	return c.Client.Close()
+}
+
+// authRejected reports whether a handshake that got past the host key failed
+// because the server turned us away: x/crypto ran out of methods it accepted,
+// or the server sent a disconnect mid-auth, as sshd does at MaxAuthTries. A
+// reset or EOF is the transport failing, which credentials would not fix.
+// x/crypto exports neither error, so its text is all there is to match.
+func authRejected(err error) bool {
+	msg := err.Error()
+	return strings.Contains(msg, "ssh: unable to authenticate") || strings.Contains(msg, "ssh: disconnect, reason")
 }
 
 // authError keeps x/crypto's text, which already lists both the methods we

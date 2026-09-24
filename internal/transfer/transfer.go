@@ -6,6 +6,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"io/fs"
@@ -68,6 +69,10 @@ func Put(ctx context.Context, c *client.Conn, local, remote string, mode fs.File
 	}
 	defer func() { _ = sc.Close() }()
 
+	if fi, err := sc.Stat(remote); err == nil && fi.IsDir() {
+		r.Err = result.Usage.Wrap(alias, fmt.Errorf("%s is a directory, and put names the file to write", remote))
+		return r
+	}
 	tmp := tempName(remote)
 	return move(ctx, c, r.Command, early,
 		func() (int64, error) { return upload(sc, src, tmp, remote, mode, maxSize) },
@@ -105,7 +110,7 @@ func Get(ctx context.Context, c *client.Conn, remote, local string, maxSize int6
 		return r
 	}
 	if fi.IsDir() {
-		r.Err = result.Transfer.Wrap(alias, fmt.Errorf("%s is a directory, and get moves one file", remote))
+		r.Err = result.Usage.Wrap(alias, fmt.Errorf("%s is a directory, and get moves one file", remote))
 		return r
 	}
 	if !fi.Mode().IsRegular() {
@@ -135,6 +140,25 @@ func Get(ctx context.Context, c *client.Conn, remote, local string, maxSize int6
 func requestErr(ctx context.Context, alias string, err error) error {
 	if ctx.Err() != nil {
 		return result.StopCause(ctx)
+	}
+	return transferErr(alias, err)
+}
+
+// errGrew is --max-size crossed mid-copy: the refusal the stat check gives up
+// front, found late, so it scores the same.
+var errGrew = errors.New("source grew past --max-size during the copy")
+
+// transferErr scores a failed transfer by who can fix it. A path that is
+// missing or forbidden, on either side, or a source over the cap is the
+// caller's to fix (usage). Anything else, above all a connection lost under
+// the copy, stays a transfer failure the caller may retry.
+func transferErr(alias string, err error) error {
+	var status *sftp.StatusError
+	switch {
+	case errors.Is(err, fs.ErrNotExist), errors.Is(err, fs.ErrPermission), errors.Is(err, errGrew):
+		return result.Usage.Wrap(alias, err)
+	case errors.As(err, &status) && (status.FxCode() == sftp.ErrSSHFxNoSuchFile || status.FxCode() == sftp.ErrSSHFxPermissionDenied):
+		return result.Usage.Wrap(alias, err)
 	}
 	return result.Transfer.Wrap(alias, err)
 }
@@ -173,7 +197,7 @@ func move(ctx context.Context, c *client.Conn, command string, early func() bool
 		r.Err = result.StopCause(ctx)
 	case err != nil:
 		discard()
-		r.Err = result.Transfer.Wrap(c.Host.Alias, err)
+		r.Err = transferErr(c.Host.Alias, err)
 	default:
 		r.Remote = &result.Remote{}
 	}
@@ -249,7 +273,7 @@ func copyCapped(w io.Writer, src io.Reader, maxSize int64) (int64, error) {
 	}
 	n, err := io.Copy(w, io.LimitReader(src, maxSize+1))
 	if err == nil && n > maxSize {
-		err = fmt.Errorf("source grew past --max-size %d during the copy", maxSize)
+		err = fmt.Errorf("%w (%d bytes)", errGrew, maxSize)
 	}
 	return n, err
 }

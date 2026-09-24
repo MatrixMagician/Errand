@@ -92,10 +92,10 @@ Client-side failures use a reserved band at the top of the range:
 
 | Code | Meaning |
 |---|---|
-| 250 | Usage error, unknown host alias, or configuration error |
+| 250 | Usage error, unknown host alias, or configuration error; also a transfer path that is missing, forbidden, or a directory, or a source over `--max-size` |
 | 251 | Host key verification failed (unknown, or — always fatal — changed) |
-| 252 | Authentication failed |
-| 253 | Network failure: DNS, refused, unreachable, handshake, or connection lost mid-command |
+| 252 | Authentication failed: the server refused every identity offered |
+| 253 | Network failure: DNS, refused, unreachable, handshake, or connection lost mid-authentication, mid-command, or mid-transfer |
 | 254 | Timeout (`--timeout` or `--connect-timeout`) or output cap breached |
 
 The band can collide with a remote command that genuinely exits 250–254; that is unavoidable in eight bits and is precisely why JSON mode exists. Document the collision; in JSON mode there is no ambiguity at all.
@@ -167,9 +167,10 @@ Resolution is: alias → `[hosts.<alias>]` table → fill gaps from `[defaults]`
 
 - Unknown key, no `accept_new`: exit 251, printing the key type, SHA256 fingerprint, and the exact `known_hosts` line the operator can add.
 - Unknown key, `accept_new = true` for that host: append to the first configured `known_hosts` file, note it on stderr, proceed. TOFU is per-host and off by default; there is no global flag and no CLI flag, so an agent can never talk itself into trusting a new key on a host the operator didn't mark.
+- Key of a type `known_hosts` has no entry for: exit 251 with a "no recorded <type> host key" diagnostic and the line to add, never reported as changed. `accept_new` may record it like an unknown key.
 - **Changed key: always exit 251.** No flag, no config option, no override. The operator edits `known_hosts` by hand or nothing happens. This is the one place the tool is allowed to be obstinate.
 
-Preferred host key algorithms, KEX, and ciphers follow the Go `x/crypto/ssh` defaults, which are conservative and maintained; do not expose tuning knobs in v1.
+Host key algorithms put the key types already recorded for the host (or the pin's type) first; otherwise host key algorithms, KEX, and ciphers follow the Go `x/crypto/ssh` defaults, which are conservative and maintained; do not expose tuning knobs in v1.
 
 ## 9. File transfer
 

@@ -6,7 +6,9 @@ import (
 	"crypto/ed25519"
 	"crypto/elliptic"
 	"crypto/rand"
+	"errors"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"path/filepath"
@@ -128,6 +130,25 @@ func TestHostKeyPolicyOtherKeyTypeIsNotAChange(t *testing.T) {
 	}
 	if want := "no recorded ecdsa-sha2-nistp256 host key"; !strings.Contains(err.Error(), want) {
 		t.Errorf("error = %q, want it to say %q", err, want)
+	}
+}
+
+// TestAuthRejected separates the server refusing our identities, which new
+// credentials fix, from the transport failing mid-exchange, which a retry
+// might. The texts are the shapes x/crypto returns from NewClientConn.
+func TestAuthRejected(t *testing.T) {
+	for _, tc := range []struct {
+		err  error
+		want bool
+	}{
+		{errors.New("ssh: handshake failed: ssh: unable to authenticate, attempted methods [none publickey], no supported methods remain"), true},
+		{errors.New("ssh: handshake failed: ssh: disconnect, reason 2: Too many authentication failures"), true},
+		{fmt.Errorf("ssh: handshake failed: %w", io.EOF), false},
+		{errors.New("ssh: handshake failed: read tcp 127.0.0.1:50000->127.0.0.1:2222: read: connection reset by peer"), false},
+	} {
+		if got := authRejected(tc.err); got != tc.want {
+			t.Errorf("authRejected(%q) = %v, want %v", tc.err, got, tc.want)
+		}
 	}
 }
 

@@ -1464,8 +1464,9 @@ func TestIntegrationPutFailures(t *testing.T) {
 	}{
 		{"missing local file", filepath.Join(t.TempDir(), "absent"), dir + "/file", 250, "usage"},
 		{"local is a directory", t.TempDir(), dir + "/file", 250, "usage"},
-		{"missing remote directory", local, dir + "/absent/file", 253, "transfer"},
-		{"unwritable remote path", local, "/proc/nope/file", 253, "transfer"},
+		{"missing remote directory", local, dir + "/absent/file", 250, "usage"},
+		{"unwritable remote path", local, "/proc/nope/file", 250, "usage"},
+		{"remote is a directory", local, dir, 250, "usage"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			code, _, stderr := errand(t, cfg, "", "put", "h", tc.local, tc.remote)
@@ -1682,8 +1683,8 @@ func TestIntegrationGetFailures(t *testing.T) {
 		code                int
 		want                string
 	}{
-		{"missing remote file", dir + "/absent", filepath.Join(down, "file"), 253, "transfer"},
-		{"remote is a directory", dir, filepath.Join(down, "file"), 253, "transfer"},
+		{"missing remote file", dir + "/absent", filepath.Join(down, "file"), 250, "usage"},
+		{"remote is a directory", dir, filepath.Join(down, "file"), 250, "usage"},
 		{"missing local directory", src, filepath.Join(down, "absent", "file"), 250, "usage"},
 		{"local is a directory", src, down, 250, "usage"},
 	} {
@@ -1699,6 +1700,21 @@ func TestIntegrationGetFailures(t *testing.T) {
 	}
 	if got := entries(t, down); len(got) != 0 {
 		t.Errorf("destination directory holds %q, want nothing", got)
+	}
+}
+
+// TestIntegrationGetMissingFileJSON is the case an agent acts on: a remote path
+// that is not there is the caller's mistake to fix, not a network to retry.
+func TestIntegrationGetMissingFileJSON(t *testing.T) {
+	s := sshtest.Start(t)
+	cfg := trusting(t, s)
+	missing := remoteDir(t, cfg) + "/absent"
+	code, stdout, stderr := errand(t, cfg, "", "get", "h", "--json", missing, filepath.Join(t.TempDir(), "file"))
+	if code != 250 {
+		t.Fatalf("code=%d, want 250; stderr=%q", code, stderr)
+	}
+	if _, env := splitEnvelope(t, stdout); env.Status != "client_error" || env.Error == nil || env.Error.Kind != "usage" {
+		t.Errorf("envelope=%+v, want client_error with kind usage", env)
 	}
 }
 
