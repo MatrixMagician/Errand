@@ -4,13 +4,14 @@ package transfer
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"io/fs"
 	"os"
 	"path"
 	"path/filepath"
-	"strconv"
 	"time"
 
 	"github.com/MatrixMagician/Errand/internal/client"
@@ -180,26 +181,37 @@ func move(ctx context.Context, c *client.Conn, command string, early func() bool
 }
 
 // tempName is a sibling of the destination, so the rename that follows stays
-// within one filesystem. The leading dot keeps it out of an unsuffixed glob and
-// the pid keeps two concurrent errands off each other's file.
+// within one filesystem. The leading dot keeps it out of an unsuffixed glob. The
+// random suffix is what makes the exclusive create safe in a directory others
+// can write: nobody can plant a symlink at a name they cannot predict, and two
+// errands never share a file.
 func tempName(remote string) string {
-	return path.Join(path.Dir(remote), "."+path.Base(remote)+".errand-"+strconv.Itoa(os.Getpid()))
+	return path.Join(path.Dir(remote), "."+path.Base(remote)+".errand-"+randomSuffix())
 }
 
 // localTempName is the same name on this side of the connection, where the
 // separator is the local one rather than SFTP's slash.
 func localTempName(local string) string {
-	return filepath.Join(filepath.Dir(local), "."+filepath.Base(local)+".errand-"+strconv.Itoa(os.Getpid()))
+	return filepath.Join(filepath.Dir(local), "."+filepath.Base(local)+".errand-"+randomSuffix())
+}
+
+func randomSuffix() string {
+	b := make([]byte, 8)
+	_, _ = rand.Read(b) // never fails: crypto/rand aborts the program instead
+	return hex.EncodeToString(b)
 }
 
 func upload(sc *sftp.Client, src io.Reader, tmp, remote string, mode fs.FileMode, maxSize int64) (int64, error) {
-	w, err := sc.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC)
+	w, err := sc.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_EXCL)
 	if err != nil {
 		return 0, err
 	}
-	n, err := copyCapped(w, src, maxSize)
+	// Before any bytes: pkg/sftp creates with no attributes, so the temp starts
+	// at the server's default and a 0600 payload would be readable in flight.
+	var n int64
+	err = w.Chmod(mode)
 	if err == nil {
-		err = w.Chmod(mode)
+		n, err = copyCapped(w, src, maxSize)
 	}
 	if cerr := w.Close(); err == nil {
 		err = cerr
@@ -214,7 +226,7 @@ func upload(sc *sftp.Client, src io.Reader, tmp, remote string, mode fs.FileMode
 // file: the remote bits are the sender's, and carrying them across would let a
 // remote 0777 decide what this machine ends up with.
 func download(src io.Reader, tmp, local string, maxSize int64) (int64, error) {
-	w, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
+	w, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
 	if err != nil {
 		return 0, err
 	}
