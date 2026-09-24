@@ -20,6 +20,12 @@ var errPut = errors.New("put")
 // same as put.
 var errGetOutsideCwd = errors.New("get outside cwd")
 
+// errEnv is run's verdict when --env is set (issue #48): sshd's AcceptEnv is
+// the only gate on what a forwarded variable can do to an otherwise-listed
+// command, and errand cannot see the remote AcceptEnv configuration to judge
+// it, so any --env is put to the human.
+var errEnv = errors.New("env")
+
 // allow answers whether the invocation in rest would be Unattended. It parses
 // exactly as the judged subcommand would, so a usage or configuration error is
 // reported the same way, but it never dials and never writes the audit log.
@@ -54,7 +60,11 @@ func allow(rest []string, stdout, stderr io.Writer) int {
 	case "get":
 		verdict = checkGetDestination(inv.fs.Arg(1))
 	case "run":
-		verdict = allowlist.Check(inv.host.AllowCommands, strings.Join(inv.fs.Args(), " "))
+		if len(inv.o.env) > 0 {
+			verdict = errEnv
+		} else {
+			verdict = allowlist.Check(inv.host.AllowCommands, strings.Join(inv.fs.Args(), " "))
+		}
 	}
 	if verdict == nil {
 		return 0

@@ -111,6 +111,7 @@ hostname = "127.0.0.1"
 		allowed bool
 	}{
 		{name: "listed command", command: "errand run h -- df -h", allowed: true},
+		{name: "listed command with --env", command: "errand run h --env A=b -- df -h"},
 		{name: "quoted pipe is one argument", command: "errand run h -- 'df -h | df'", allowed: true},
 		{name: "json flag before the alias", command: "errand run h --json -- uptime", allowed: true},
 		{name: "prefix entry", command: "errand run h --json -- systemctl status nginx", allowed: true},
