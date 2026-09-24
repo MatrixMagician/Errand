@@ -8,6 +8,7 @@ import (
 	"flag"
 	"io"
 	"os"
+	"path/filepath"
 	"regexp"
 	"slices"
 	"strings"
@@ -358,6 +359,76 @@ func TestAllowFixedVerdicts(t *testing.T) {
 				t.Errorf("code=%d stdout=%q, want %d and %q; stderr=%q", code, stdout, c.code, c.stdout, stderr)
 			}
 		})
+	}
+}
+
+// TestAllowGetChecksDestination is issue #47: get is unattended only when its
+// local destination resolves inside the current working directory, with
+// symlinks in the destination's parent resolved before the check.
+func TestAllowGetChecksDestination(t *testing.T) {
+	cfg, err := filepath.Abs("testdata/fixture.toml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("ERRAND_CONFIG", cfg)
+	dir := t.TempDir()
+	t.Chdir(dir)
+	if err := os.Mkdir(filepath.Join(dir, "out"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	outside := t.TempDir()
+	if err := os.Symlink(outside, filepath.Join(dir, "escape")); err != nil {
+		t.Fatal(err)
+	}
+
+	cases := []struct {
+		name   string
+		local  string
+		code   int
+		stdout string
+	}{
+		{name: "relative inside cwd", local: "out/file"},
+		{name: "parent traversal", local: "../file", code: 1, stdout: "get outside cwd\n"},
+		{name: "absolute elsewhere", local: filepath.Join(outside, "file"), code: 1, stdout: "get outside cwd\n"},
+		{name: "symlinked parent escapes cwd", local: "escape/file", code: 1, stdout: "get outside cwd\n"},
+		{name: "missing parent fails closed", local: "missing/file", code: 1, stdout: "get outside cwd\n"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			code, stdout, stderr := runCLI(t, "allow", "get", "web-prod", "remote", c.local)
+			if code != c.code || stdout != c.stdout {
+				t.Errorf("code=%d stdout=%q, want %d and %q; stderr=%q", code, stdout, c.code, c.stdout, stderr)
+			}
+		})
+	}
+}
+
+// TestAllowGetResolvesSymlinkedCwd is the companion bug to #47: a cwd reached
+// through a symlink (macOS's /tmp -> /private/tmp, or any symlinked home)
+// must not make every in-cwd get look like it escapes. $PWD is what a shell
+// hands a subprocess for its unresolved view of cwd, so setting it here
+// reproduces that view without depending on where the OS temp dir happens to
+// live.
+func TestAllowGetResolvesSymlinkedCwd(t *testing.T) {
+	cfg, err := filepath.Abs("testdata/fixture.toml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("ERRAND_CONFIG", cfg)
+	target := t.TempDir()
+	if err := os.Mkdir(filepath.Join(target, "out"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(t.TempDir(), "link")
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(target)
+	t.Setenv("PWD", link)
+
+	code, stdout, stderr := runCLI(t, "allow", "get", "web-prod", "remote", "out/file")
+	if code != 0 || stdout != "" {
+		t.Errorf("code=%d stdout=%q, want 0 and empty; stderr=%q", code, stdout, stderr)
 	}
 }
 

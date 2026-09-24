@@ -114,6 +114,7 @@ hostname = "127.0.0.1"
 		{name: "hosts", command: "errand hosts", allowed: true},
 		{name: "check", command: "errand check h", allowed: true},
 		{name: "get", command: "errand get h /etc/hostname hostname.copy", allowed: true},
+		{name: "get outside cwd", command: "errand get h /etc/hostname ../hostname.copy"},
 		{name: "absolute path to errand", command: bin + " hosts", allowed: true},
 		{name: "another binary named errand", command: impostor + " hosts"},
 		{name: "relative path to the real errand binary", command: "./errand run h -- df", dir: relDir},
