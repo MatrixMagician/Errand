@@ -80,8 +80,15 @@ func allow(rest []string, stdout, stderr io.Writer) int {
 // and a symlinked parent that escapes cwd does not stand in for a plain path
 // outside it. Either resolution failing to run fails closed rather than
 // falling back to an unresolved comparison, so the verdict never depends on
-// local's parent existing yet, even though get is what creates it.
+// local's parent existing yet, even though get is what creates it. Any ..
+// component in local is refused first: filepath.Abs cleans link/.. lexically
+// while the kernel follows link before applying .., so the two disagree.
 func checkGetDestination(local string) error {
+	for _, part := range strings.Split(filepath.ToSlash(local), "/") {
+		if part == ".." {
+			return errGetOutsideCwd
+		}
+	}
 	cwd, err := os.Getwd()
 	if err != nil {
 		return errGetOutsideCwd
