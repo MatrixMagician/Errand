@@ -392,6 +392,8 @@ func TestAllowGetChecksDestination(t *testing.T) {
 		{name: "absolute elsewhere", local: filepath.Join(outside, "file"), code: 1, stdout: "get outside cwd\n"},
 		{name: "symlinked parent escapes cwd", local: "escape/file", code: 1, stdout: "get outside cwd\n"},
 		{name: "missing parent fails closed", local: "missing/file", code: 1, stdout: "get outside cwd\n"},
+		{name: "dotdot after a symlink out of cwd", local: "escape/../file", code: 1, stdout: "get outside cwd\n"},
+		{name: "dotdot after a directory inside cwd", local: "out/../file", code: 1, stdout: "get outside cwd\n"},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
